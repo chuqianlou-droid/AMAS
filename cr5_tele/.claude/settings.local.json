@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show *)",
+      "Bash(pip list *)",
+      "Bash(python3 -c \"import oculus_reader; print\\(oculus_reader.__file__\\)\")",
+      "Bash(python3 -c \"from oculus_reader import OculusReader; r = OculusReader; import inspect; print\\(inspect.getsource\\(r.get_transformations_and_buttons\\)\\)\")",
+      "Bash(python3 *)"
+    ]
+  }
+}
