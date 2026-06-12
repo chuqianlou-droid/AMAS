@@ -39,7 +39,7 @@ setup(
         'quest3_cr5_servop_teleop = cr5_teleop.quest3_cr5_servop_teleop:main',
         'test_moveit_pose = cr5_teleop.test_moveit_pose:main',
         'test_cartesian_execute = cr5_teleop.test_cartesian_execute:main',
-        'ServoP_test = cr5_teleop.ServoP_test: main',
+        'ServoP_test = cr5_teleop.ServoP_test: main'
     ],
 },
 )
