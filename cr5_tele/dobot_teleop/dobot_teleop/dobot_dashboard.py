@@ -196,6 +196,31 @@ class DobotDashboard:
         self.require_ok(response, "ServoP")
         return response
 
+    def servoj(
+        self,
+        joints_deg: Iterable[float],
+        t: float,
+        aheadtime: float,
+        gain: float,
+    ) -> str:
+        joints = list(joints_deg)
+        if len(joints) != 6:
+            raise ValueError("ServoJ joints must contain 6 values")
+
+        response = self._api.ServoJ(
+            joints[0],
+            joints[1],
+            joints[2],
+            joints[3],
+            joints[4],
+            joints[5],
+            t=t,
+            aheadtime=aheadtime,
+            gain=gain,
+        )
+        self.require_ok(response, "ServoJ")
+        return response
+
 
 def format_pose(pose: Iterable[float]) -> str:
     values = list(pose)

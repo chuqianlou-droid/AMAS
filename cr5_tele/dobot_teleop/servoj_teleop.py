@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 
 """
-Direct Quest3 UDP -> Dobot ServoP teleoperation (no ROS).
+Direct Quest3 UDP -> Dobot ServoJ-first teleoperation (no ROS).
 
 Key features (ported from lerobot_franka_teleop):
   * Frame-to-frame delta (position + orientation) for smooth VR motion.
   * RG (Right Grip) deadman switch — pose accrues only while gripped.
   * Right Trigger -> gripper command (requires dobot gripper support).
-  * Full 6-DOF output: x, y, z, rx, ry, rz.
-  * Two-parameter scaling (position + rotation) and per-channel sign flip.
+  * Full 6-DOF output.
+  * Default: ServoJ (IK pre-check with joint-limit guard). Optional: ServoP.
 """
 
 import argparse
@@ -25,10 +25,43 @@ from dobot_teleop.dobot_dashboard import (
 from dobot_teleop.quest_udp import QuestUdpReceiver
 from dobot_teleop.teleop_mapping import QuestTeleopConfig, QuestTeleopMapper
 
+# ---------------------------------------------------------------------------
+# CR5 joint limits and safety check
+# ---------------------------------------------------------------------------
+CR5_JOINT_LIMITS = [
+    (-360.0, 360.0),  # J1
+    (-360.0, 360.0),  # J2
+    (-160.0, 160.0),  # J3  (tightest)
+    (-360.0, 360.0),  # J4
+    (-360.0, 360.0),  # J5
+    (-360.0, 360.0),  # J6
+]
+
+JOINT_SAFETY_MARGIN_DEG = 0.5
+
+
+def check_joint_limits(joints):
+    """Return (ok, message).  ok=False means at least one joint exceeds the
+    safe range (mechanical limit minus JOINT_SAFETY_MARGIN_DEG)."""
+    for i, (j, (lo, hi)) in enumerate(zip(joints, CR5_JOINT_LIMITS)):
+        safe_lo = lo + JOINT_SAFETY_MARGIN_DEG
+        safe_hi = hi - JOINT_SAFETY_MARGIN_DEG
+        if j < safe_lo or j > safe_hi:
+            return False, (
+                f"J{i + 1}={j:.2f}° out of safe range "
+                f"[{safe_lo:.1f}, {safe_hi:.1f}]"
+            )
+    return True, ""
+
+
+def format_joints(joints):
+    """Compact joint-angle string for logging."""
+    return " ".join(f"J{i + 1}={j:.2f}" for i, j in enumerate(joints))
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Direct Quest3 UDP to Dobot ServoP teleoperation, no ROS."
+        description="Direct Quest3 UDP to Dobot ServoJ/ServoP teleoperation, no ROS."
     )
     # ---- robot connection --------------------------------------------------
     parser.add_argument("--robot-ip", required=True, help="Dobot controller IP")
@@ -38,11 +71,15 @@ def parse_args():
     parser.add_argument("--udp-host", default="0.0.0.0")
     parser.add_argument("--udp-port", type=int, default=5005)
 
-    # ---- ServoP parameters ------------------------------------------------
+    # ---- Servo parameters --------------------------------------------------
+    parser.add_argument("--servo-mode", choices=("joint", "cartesian"),
+                        default="joint",
+                        help="joint = ServoJ (IK pre-check + joint limits); "
+                             "cartesian = ServoP (original behaviour)")
     parser.add_argument("--command-rate", type=float, default=10.0)
     parser.add_argument("--servo-t", type=float, default=0.10)
     parser.add_argument("--servo-aheadtime", type=float, default=50.0)
-    parser.add_argument("--servo-gain", type=float, default=200.0)
+    parser.add_argument("--servo-gain", type=float, default=500.0)
 
     # ---- mapper parameters ------------------------------------------------
     parser.add_argument("--position-scale", type=float, default=0.20)
@@ -51,6 +88,10 @@ def parse_args():
                         default="frame-delta",
                         help="frame-delta accumulates per-frame rotation; "
                              "origin-delta follows Quest orientation relative to alignment")
+    parser.add_argument("--filter-ratio-pos", type=float, default=0.0,
+                        help="Quest position EMA ratio, 0 disables filtering")
+    parser.add_argument("--filter-ratio-rot", type=float, default=0.0,
+                        help="Quest rotation EMA ratio, 0 disables filtering")
     parser.add_argument("--target-deadband-mm", type=float, default=2.0)
     parser.add_argument("--target-deadband-deg", type=float, default=1.0)
     parser.add_argument("--max-step-mm", type=float, default=6.0)
@@ -90,6 +131,8 @@ def parse_args():
     parser.add_argument("--dry-run", action="store_true",
                         help="Print targets without sending to robot")
     parser.add_argument("--log-targets", action="store_true")
+    parser.add_argument("--log-joints", action="store_true",
+                        help="Append GetAngle joint values to target logs")
     parser.add_argument("--log-quest", action="store_true",
                         help="Print raw Quest pose and delta from align origin")
     parser.add_argument("--verbose-tcp", action="store_true")
@@ -161,6 +204,8 @@ def make_config(args):
         position_scale=args.position_scale,
         rotation_scale=args.rotation_scale,
         rotation_mode=args.rotation_mode.replace("-", "_"),
+        filter_ratio_pos=args.filter_ratio_pos,
+        filter_ratio_rot=args.filter_ratio_rot,
         target_deadband_mm=args.target_deadband_mm,
         target_deadband_deg=args.target_deadband_deg,
         max_step_mm=args.max_step_mm,
@@ -227,7 +272,7 @@ def main():
     if abs(args.servo_t - period) > 0.02:
         print(
             f"Warning: servo_t={args.servo_t:.3f}s but command period={period:.3f}s. "
-            "ServoP is usually smoother when these match."
+            "ServoJ/ServoP is usually smoother when these match."
         )
 
     config = make_config(args)
@@ -253,6 +298,7 @@ def main():
 
     print(f"Quest UDP listening on {args.udp_host}:{args.udp_port}")
     print(f"Dobot dashboard target: {args.robot_ip}:{args.dashboard_port}")
+    print(f"Servo mode: {args.servo_mode.upper()}")
     print(f"Mapping: {mapper.mapping_text()}")
     print(
         "Keys: e=align+enable, p=pause, g=GetPose, c=ClearError, "
@@ -382,36 +428,78 @@ def main():
                 sent = info["sent_step_mm"]
                 if sent > 0.0:
                     if not args.dry_run:
-                        try:
-                            client.servop(
-                                target,
-                                t=args.servo_t,
-                                aheadtime=args.servo_aheadtime,
-                                gain=args.servo_gain,
-                            )
-                        except DobotDashboardError:
+                        if args.servo_mode == "joint":
+                            # ---- ServoJ path: IK + joint-limit check ----------
                             try:
-                                mode = client.robot_mode()
-                            except Exception as mode_exc:
-                                mode = f"unavailable ({mode_exc})"
-                            try:
-                                angles = client.get_angle()
-                                angle_text = " ".join(
-                                    f"J{i + 1}={angle:.1f}" for i, angle in enumerate(angles)
+                                joints = client.inverse_kin(target)
+                            except DobotDashboardError:
+                                print(
+                                    f"IK unsolvable for {format_pose(target)}, "
+                                    f"step={sent:.2f}mm, skipping"
                                 )
-                            except Exception as angle_exc:
-                                angle_text = f"unavailable ({angle_exc})"
-                            print(
-                                "ServoP rejected target: "
-                                f"{format_pose(target)}, "
-                                f"step={sent:.2f}mm, "
-                                f"delta_pos={info['delta_pos_mm']:.1f}mm, "
-                                f"delta_rot={info['delta_rot_deg']:.1f}deg, "
-                                f"robot_mode={mode}, "
-                                f"joints=[{angle_text}]"
-                            )
-                            raise
-                        # Gripper via ServoP (7th value)
+                                continue
+
+                            ok, limit_msg = check_joint_limits(joints)
+                            if not ok:
+                                print(
+                                    f"Joint-limit skip: {limit_msg}  "
+                                    f"target={format_pose(target)}"
+                                )
+                                continue
+
+                            try:
+                                client.servoj(
+                                    joints,
+                                    t=args.servo_t,
+                                    aheadtime=args.servo_aheadtime,
+                                    gain=args.servo_gain,
+                                )
+                            except DobotDashboardError as exc:
+                                try:
+                                    mode = client.robot_mode()
+                                except Exception as mode_exc:
+                                    mode = f"unavailable ({mode_exc})"
+                                print(
+                                    f"ServoJ rejected: "
+                                    f"target={format_pose(target)}, "
+                                    f"joints=[{format_joints(joints)}], "
+                                    f"robot_mode={mode}, "
+                                    f"response={exc}, skipping"
+                                )
+                                continue
+                        else:
+                            # ---- ServoP path (original) ----------------------
+                            try:
+                                client.servop(
+                                    target,
+                                    t=args.servo_t,
+                                    aheadtime=args.servo_aheadtime,
+                                    gain=args.servo_gain,
+                                )
+                            except DobotDashboardError:
+                                try:
+                                    mode = client.robot_mode()
+                                except Exception as mode_exc:
+                                    mode = f"unavailable ({mode_exc})"
+                                try:
+                                    angles = client.get_angle()
+                                    angle_text = " ".join(
+                                        f"J{i + 1}={angle:.1f}" for i, angle in enumerate(angles)
+                                    )
+                                except Exception as angle_exc:
+                                    angle_text = f"unavailable ({angle_exc})"
+                                print(
+                                    "ServoP rejected target: "
+                                    f"{format_pose(target)}, "
+                                    f"step={sent:.2f}mm, "
+                                    f"delta_pos={info['delta_pos_mm']:.1f}mm, "
+                                    f"delta_rot={info['delta_rot_deg']:.1f}deg, "
+                                    f"robot_mode={mode}, "
+                                    f"joints=[{angle_text}], "
+                                    "skipping"
+                                )
+                                continue
+                        # Gripper
                         if args.enable_gripper:
                             gripper_cmd = QuestTeleopMapper.gripper_from_trigger(
                                 latest_pose
@@ -430,6 +518,16 @@ def main():
                     grip_str = ""
                     if args.enable_gripper:
                         grip_str = f" grip={QuestTeleopMapper.gripper_from_trigger(latest_pose):.2f}"
+                    joint_str = ""
+                    if args.log_joints:
+                        if args.dry_run:
+                            joint_str = " joints=[dry-run]"
+                        else:
+                            try:
+                                angles = client.get_angle()
+                                joint_str = f" joints=[{format_joints(angles)}]"
+                            except Exception as exc:
+                                joint_str = f" joints=[unavailable: {exc}]"
                     deadman_str = (
                         " [NO-DEADMAN]"
                         if args.ignore_deadman
@@ -441,6 +539,7 @@ def main():
                         f"Δpos={info['delta_pos_mm']:.1f}mm "
                         f"Δrot={info['delta_rot_deg']:.1f}deg"
                         f"{grip_str}"
+                        f"{joint_str}"
                         f"{deadman_str}"
                     )
                     last_target_log_time = now

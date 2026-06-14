@@ -83,7 +83,15 @@ class QuestUdpReceiver:
             ],
             "A": ["A", "buttonA"],
             "B": ["B", "buttonB"],
-            "rightTrig": ["rightTrig", "rightTrigger", "trigger", "IndexTrigger"],
+            "rightTrig": [
+                "rightTrig",
+                "rightTrigger",
+                "rightIndexTrigger",
+                "trigger",
+                "IndexTrigger",
+                "RIndexTrigger",
+                "SecondaryIndexTrigger",
+            ],
             "leftTrig": ["leftTrig", "leftTrigger"],
             "LG": ["LG", "leftGrip", "LeftGrip", "leftGripButton"],
         }

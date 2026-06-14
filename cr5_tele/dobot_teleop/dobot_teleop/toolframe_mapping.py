@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Quest 3 → Dobot pose mapper.
+Quest 3 → Dobot pose mapper with tool-frame orientation control.
 
 References lerobot_franka_teleop's OculusRobot._compute_delta_pose() for:
   - Frame-to-frame delta computation (position + orientation)
@@ -24,6 +24,14 @@ def clamp(value: float, lower: float, upper: float) -> float:
 
 def norm3(v: List[float]) -> float:
     return math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
+
+
+def angle_diff_deg(target: float, current: float) -> float:
+    return (target - current + 180.0) % 360.0 - 180.0
+
+
+def normalize_angle_deg(value: float) -> float:
+    return (value + 180.0) % 360.0 - 180.0
 
 
 @dataclass
@@ -88,14 +96,13 @@ class QuestTeleopConfig:
     workspace_max_z_mm: float = 800.0
 
 
-class QuestTeleopMapper:
-    """Frame-to-frame delta mapper: Quest 3 → Dobot ServoP target.
+class ToolFrameQuestTeleopMapper:
+    """Quest 3 → Dobot target mapper with tool-frame rotation.
 
-    Strategy (same as lerobot_franka_teleop's OculusRobot):
-      - While RG is pressed: small position + rotation deltas from the
-        previous Quest frame are accumulated.
-      - When RG is released: the accumulator freezes and the previous-
-        frame reference is cleared so the next grip doesn't cause a jump.
+    Position mapping is intentionally unchanged from the original mapper.
+    Orientation mapping uses rotation-matrix conjugation for Quest→robot axes
+    and composes the final orientation in the tool frame:
+        target_R = origin_R @ delta_R
     """
 
     def __init__(self, config: QuestTeleopConfig):
@@ -112,7 +119,9 @@ class QuestTeleopMapper:
         self._filtered_R: Optional[R] = None
         self._accum_delta_pos: np.ndarray = np.zeros(3)       # accumulated robot pos delta (mm)
         self._accum_delta_rot: np.ndarray = np.zeros(3)       # accumulated robot rot delta (rad)
+        self._origin_delta_base_rot: np.ndarray = np.zeros(3) # rot offset preserved across RG clutch
         self._last_target: Optional[List[float]] = None
+        self._last_rg_pressed = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -131,7 +140,9 @@ class QuestTeleopMapper:
 
         self._accum_delta_pos = np.zeros(3)
         self._accum_delta_rot = np.zeros(3)
+        self._origin_delta_base_rot = np.zeros(3)
         self._last_target = list(robot_pose)
+        self._last_rg_pressed = False
 
     def target_from_quest(
         self, quest_pose: QuestPose, rg_pressed: bool = False
@@ -150,6 +161,16 @@ class QuestTeleopMapper:
         if self.quest_origin is None or self.robot_origin is None:
             raise RuntimeError("QuestTeleopMapper.reset() must be called first")
 
+        if not rg_pressed:
+            self._seed_filter(quest_pose)
+            self._prev_quest_T = None
+            self._last_rg_pressed = False
+            return list(self._last_target), self._info_for_target(self._last_target)
+
+        if not self._last_rg_pressed:
+            self._reset_hand_origin_for_clutch(quest_pose)
+        self._last_rg_pressed = True
+
         delta_pos, frame_delta_rot = self._compute_frame_delta(quest_pose, rg_pressed)
 
         # ---- scale & sign --------------------------------------------------
@@ -164,27 +185,25 @@ class QuestTeleopMapper:
             scaled_pos[i] *= self._signs[i]
             scaled_rot[i] *= self._signs[i + 3]
 
-        # ---- total-motion limits (applied to each step) --------------------
-        scaled_pos = self._cap_norm(
-            scaled_pos, self.cfg.max_total_translation_mm
-        )
-        scaled_rot = self._cap_norm(
-            scaled_rot, math.radians(self.cfg.max_total_rotation_deg)
-        )
-
         # accumulate position. Rotation can be frame-to-frame accumulated or
         # absolute relative to the alignment origin, depending on mode.
         self._accum_delta_pos += scaled_pos
+        self._accum_delta_pos = self._cap_norm(
+            self._accum_delta_pos, self.cfg.max_total_translation_mm
+        )
         if self.cfg.rotation_mode == "origin_delta":
-            self._accum_delta_rot = scaled_rot
+            self._accum_delta_rot = self._origin_delta_base_rot + scaled_rot
         else:
             self._accum_delta_rot += scaled_rot
+        self._accum_delta_rot = self._cap_norm(
+            self._accum_delta_rot, math.radians(self.cfg.max_total_rotation_deg)
+        )
 
-        # ---- build target (correct rotation composition) --------------------
-        # target_R = delta_R @ origin_R   (matrix multiply, not Euler add)
+        # ---- build target --------------------------------------------------
+        # Tool-frame rotation: right-multiply the local delta onto the origin.
         origin_R = self._euler_deg_to_R(self.robot_origin[3:])
         delta_R_mat = R.from_rotvec(self._accum_delta_rot).as_matrix()
-        target_R = delta_R_mat @ origin_R
+        target_R = origin_R @ delta_R_mat
         target_euler = R.from_matrix(target_R).as_euler("XYZ", degrees=True)
 
         raw_target: List[float] = [
@@ -196,20 +215,11 @@ class QuestTeleopMapper:
             float(target_euler[2]),
         ]
         self._clamp_workspace(raw_target)
+        self._sync_accum_pos_from_target(raw_target)
 
         target = self._deadband_and_step_limit(raw_target)
 
-        info: Dict[str, float] = {
-            "delta_pos_mm": float(np.linalg.norm(self._accum_delta_pos)),
-            "delta_rot_deg": float(math.degrees(np.linalg.norm(self._accum_delta_rot))),
-            "sent_step_mm": float(
-                math.sqrt(
-                    (target[0] - self._last_target[0]) ** 2
-                    + (target[1] - self._last_target[1]) ** 2
-                    + (target[2] - self._last_target[2]) ** 2
-                )
-            ),
-        }
+        info = self._info_for_target(target)
 
         self._last_target = target
         return target, info
@@ -217,6 +227,21 @@ class QuestTeleopMapper:
     # ------------------------------------------------------------------
     #  Internal helpers
     # ------------------------------------------------------------------
+
+    def _reset_hand_origin_for_clutch(self, quest_pose: QuestPose) -> None:
+        """Reset Quest hand origin on RG press without resetting robot origin.
+
+        The accumulated robot delta is intentionally preserved so releasing RG,
+        moving the controller back to a comfortable pose, and pressing RG again
+        behaves like a clutch.
+        """
+        self.quest_origin = quest_pose
+        self._seed_filter(quest_pose)
+        q = [quest_pose.qx, quest_pose.qy, quest_pose.qz, quest_pose.qw]
+        self._prev_quest_T = self._quat_pos_to_T(
+            [quest_pose.x, quest_pose.y, quest_pose.z], q
+        )
+        self._origin_delta_base_rot = self._accum_delta_rot.copy()
 
     @staticmethod
     def _quat_pos_to_T(pos: List[float], quat: List[float]) -> np.ndarray:
@@ -252,17 +277,18 @@ class QuestTeleopMapper:
         oculus_dp = current_T[:3, 3] - self._prev_quest_T[:3, 3]
         robot_dp = self._pos_T @ oculus_dp
 
-        # Rotation delta
-        #   delta_rot = current @ prev^T   → rotation from prev to current
+        # Rotation delta: current @ prev^T maps previous controller frame to
+        # current controller frame. Convert axes with matrix conjugation rather
+        # than treating the rotvec as a position vector.
         delta_oculus = current_T[:3, :3] @ self._prev_quest_T[:3, :3].T
-        oculus_rv = R.from_matrix(delta_oculus).as_rotvec()
-        robot_rv = self._rot_T @ oculus_rv
+        delta_robot = self._map_rotation_matrix(delta_oculus)
+        robot_rv = R.from_matrix(delta_robot).as_rotvec()
 
         self._prev_quest_T = current_T.copy()
         return robot_dp, robot_rv
 
     def _compute_origin_delta_rot(self, rg_pressed: bool) -> np.ndarray:
-        """Quest orientation delta from alignment origin mapped to robot axes."""
+        """Tool-frame Quest orientation delta from alignment origin."""
         if not rg_pressed or self.quest_origin is None or self._filtered_R is None:
             return np.zeros(3)
 
@@ -274,9 +300,12 @@ class QuestTeleopMapper:
         ]
         origin_R = R.from_quat(origin_q).as_matrix()
         current_R = self._filtered_R.as_matrix()
-        delta_oculus = current_R @ origin_R.T
-        oculus_rv = R.from_matrix(delta_oculus).as_rotvec()
-        return self._rot_T @ oculus_rv
+        delta_oculus_local = origin_R.T @ current_R
+        delta_robot_local = self._map_rotation_matrix(delta_oculus_local)
+        return R.from_matrix(delta_robot_local).as_rotvec()
+
+    def _map_rotation_matrix(self, delta_oculus: np.ndarray) -> np.ndarray:
+        return self._rot_T @ delta_oculus @ self._rot_T.T
 
     def _seed_filter(self, quest_pose: QuestPose) -> None:
         q = [quest_pose.qx, quest_pose.qy, quest_pose.qz, quest_pose.qw]
@@ -334,12 +363,23 @@ class QuestTeleopMapper:
         pose[1] = clamp(pose[1], c.workspace_min_y_mm, c.workspace_max_y_mm)
         pose[2] = clamp(pose[2], c.workspace_min_z_mm, c.workspace_max_z_mm)
 
+    def _sync_accum_pos_from_target(self, pose: List[float]) -> None:
+        self._accum_delta_pos = np.array(
+            [
+                pose[0] - self.robot_origin[0],
+                pose[1] - self.robot_origin[1],
+                pose[2] - self.robot_origin[2],
+            ],
+            dtype=float,
+        )
+
     def _deadband_and_step_limit(
         self, raw_target: List[float]
     ) -> List[float]:
         cur = self._last_target
         pos_dist = norm3([raw_target[i] - cur[i] for i in range(3)])
-        rot_dist = norm3([raw_target[i] - cur[i] for i in range(3, 6)])
+        rot_diffs = [angle_diff_deg(raw_target[i], cur[i]) for i in range(3, 6)]
+        rot_dist = norm3(rot_diffs)
 
         db_mm = self.cfg.target_deadband_mm
         db_deg = self.cfg.target_deadband_deg
@@ -361,13 +401,30 @@ class QuestTeleopMapper:
         rs = self.cfg.max_step_deg
         if rot_dist > rs > 0.0:
             r = rs / rot_dist
-            for i in range(3, 6):
-                tgt[i] += (raw_target[i] - cur[i]) * r
+            for axis, i in enumerate(range(3, 6)):
+                tgt[i] = normalize_angle_deg(cur[i] + rot_diffs[axis] * r)
         else:
             for i in range(3, 6):
                 tgt[i] = raw_target[i]
 
         return tgt
+
+    def _info_for_target(self, target: List[float]) -> Dict[str, float]:
+        rot_diffs = [
+            angle_diff_deg(target[i], self._last_target[i]) for i in range(3, 6)
+        ]
+        return {
+            "delta_pos_mm": float(np.linalg.norm(self._accum_delta_pos)),
+            "delta_rot_deg": float(math.degrees(np.linalg.norm(self._accum_delta_rot))),
+            "sent_step_mm": float(
+                math.sqrt(
+                    (target[0] - self._last_target[0]) ** 2
+                    + (target[1] - self._last_target[1]) ** 2
+                    + (target[2] - self._last_target[2]) ** 2
+                )
+            ),
+            "sent_step_deg": float(norm3(rot_diffs)),
+        }
 
     def mapping_text(self) -> str:
         return (
@@ -390,5 +447,6 @@ class QuestTeleopMapper:
 
 
 # ---- backward-compatible aliases ----------------------------------------
+QuestTeleopMapper = ToolFrameQuestTeleopMapper
 DirectTeleopConfig = QuestTeleopConfig
-DirectTeleopMapper = QuestTeleopMapper
+DirectTeleopMapper = ToolFrameQuestTeleopMapper
