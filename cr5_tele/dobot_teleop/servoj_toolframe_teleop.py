@@ -17,6 +17,8 @@ import sys
 import threading
 import time
 
+from scipy.spatial.transform import Rotation as R
+
 from dobot_teleop.dobot_dashboard import (
     DobotDashboard,
     DobotDashboardError,
@@ -24,6 +26,12 @@ from dobot_teleop.dobot_dashboard import (
 )
 from dobot_teleop.quest_udp import QuestUdpReceiver
 from dobot_teleop.toolframe_mapping import QuestTeleopConfig, QuestTeleopMapper
+from dobot_teleop.teleop_action_stream import TeleopAction, TeleopActionPublisher
+from dobot_teleop.transforms import (
+    ToolOffsetConfig,
+    apply_tool_offset,
+    format_tool_offset_config,
+)
 
 # ---------------------------------------------------------------------------
 # CR5 joint limits and safety check
@@ -52,6 +60,38 @@ def check_joint_limits(joints):
                 f"[{safe_lo:.1f}, {safe_hi:.1f}]"
             )
     return True, ""
+
+
+def shortest_angle_diff_deg(target: float, current: float) -> float:
+    """Shortest signed angle difference in degrees, normalized to [-180, 180)."""
+    return (target - current + 180.0) % 360.0 - 180.0
+
+
+def plan_joint_step(
+    desired_joints: list,
+    last_sent_joints: list,
+    max_joint_step_deg: float,
+):
+    """Limit each joint's step to ``max_joint_step_deg`` degrees.
+
+    Returns:
+        planned:       List of rate-limited joint angles.
+        max_abs_step:  Largest absolute joint delta applied this tick (deg).
+        limited:       True if any joint was clipped.
+    """
+    planned = []
+    max_abs_step = 0.0
+    limited = False
+
+    for desired, current in zip(desired_joints, last_sent_joints):
+        delta = shortest_angle_diff_deg(desired, current)
+        clipped = clamp(delta, -max_joint_step_deg, max_joint_step_deg)
+        if abs(clipped - delta) > 1e-9:
+            limited = True
+        max_abs_step = max(max_abs_step, abs(clipped))
+        planned.append(current + clipped)
+
+    return planned, max_abs_step, limited
 
 
 def format_joints(joints):
@@ -84,6 +124,11 @@ def parse_args():
     parser.add_argument("--servo-t", type=float, default=0.10)
     parser.add_argument("--servo-aheadtime", type=float, default=50.0)
     parser.add_argument("--servo-gain", type=float, default=500.0)
+
+    # ---- joint-level rate limiting (critical near singularities) -----------
+    parser.add_argument("--max-joint-speed-deg-s", type=float, default=30.0,
+                        help="Max per-joint speed for ServoJ step limiting (deg/s). "
+                             "Set lower (e.g. 10-15) if the robot jerks near singularities.")
 
     # ---- mapper parameters ------------------------------------------------
     parser.add_argument("--position-scale", type=float, default=0.20)
@@ -143,9 +188,30 @@ def parse_args():
     parser.add_argument("--ignore-deadman", action="store_true",
                         help="Move without requiring the Quest RG button")
 
+    # ---- recorder action stream ------------------------------------------
+    parser.add_argument("--publish-action-stream", action="store_true",
+                        help="Publish latest-only CR5A 7D actions for the read-only dataset recorder")
+    parser.add_argument("--action-stream-host", default="127.0.0.1",
+                        help="UDP host for --publish-action-stream")
+    parser.add_argument("--action-stream-port", type=int, default=5010,
+                        help="UDP port for --publish-action-stream")
+
     # ---- gripper -----------------------------------------------------------
     parser.add_argument("--enable-gripper", action="store_true",
                         help="Send gripper commands via ServoP")
+
+    # ── Tool offset (for action stream metadata) ──────────────────────────
+    parser.add_argument("--use-gripper-center-pose", action="store_true", default=True,
+                        help="Record gripper-center poses in action stream metadata")
+    parser.add_argument("--no-use-gripper-center-pose", action="store_false",
+                        dest="use_gripper_center_pose")
+    parser.add_argument("--tool-offset-x-mm", type=float, default=0.0)
+    parser.add_argument("--tool-offset-y-mm", type=float, default=0.0)
+    parser.add_argument("--tool-offset-z-mm", type=float, default=160.0)
+    parser.add_argument("--tool-offset-rx-deg", type=float, default=0.0)
+    parser.add_argument("--tool-offset-ry-deg", type=float, default=0.0)
+    parser.add_argument("--tool-offset-rz-deg", type=float, default=0.0)
+    parser.add_argument("--controller-tool-offset-already-set", action="store_true")
 
     return parser.parse_args()
 
@@ -234,14 +300,17 @@ def make_config(args):
 def enable_teleop(client, mapper, latest_pose, args):
     if latest_pose is None:
         print("Cannot enable: no Quest UDP pose received yet.")
-        return False
+        return False, None
 
     if args.dry_run:
         robot_pose = [0.0, 0.0, 300.0, -180.0, 0.0, 90.0]
+        robot_joints = [0.0] * 6
         print(f"DRY RUN robot origin: {format_pose(robot_pose)}")
     else:
         robot_pose = client.get_pose()
+        robot_joints = client.get_angle()
         print(f"Robot origin: {format_pose(robot_pose)}")
+        print(f"Robot joints: {format_joints(robot_joints)}")
 
     workspace_checks = [
         ("X", robot_pose[0], args.workspace_min_x_mm, args.workspace_max_x_mm),
@@ -259,7 +328,7 @@ def enable_teleop(client, mapper, latest_pose, args):
             + "; ".join(outside)
         )
         print("Move the robot inside the workspace or loosen the workspace limits.")
-        return False
+        return False, None
 
     mapper.reset(latest_pose, robot_pose)
     print(
@@ -267,12 +336,22 @@ def enable_teleop(client, mapper, latest_pose, args):
         f"Quest origin=({latest_pose.x:.3f},{latest_pose.y:.3f},{latest_pose.z:.3f}) "
         f"RG buttons={list(latest_pose.buttons.keys())}"
     )
-    return True
+    return True, robot_joints
+
+
+def _base_frame_pose_delta(reference_pose, target_pose):
+    """Return the target delta used by the Cartesian controller in mm/deg."""
+    delta_pos = [float(target_pose[index] - reference_pose[index]) for index in range(3)]
+    reference_R = R.from_euler("XYZ", reference_pose[3:], degrees=True).as_matrix()
+    target_R = R.from_euler("XYZ", target_pose[3:], degrees=True).as_matrix()
+    delta_euler = R.from_matrix(target_R @ reference_R.T).as_euler("XYZ", degrees=True)
+    return [*delta_pos, *map(float, delta_euler)]
 
 
 def main():
     args = parse_args()
     period = 1.0 / max(args.command_rate, 1.0)
+    max_joint_step_deg = args.max_joint_speed_deg_s * period
     if abs(args.servo_t - period) > 0.02:
         print(
             f"Warning: servo_t={args.servo_t:.3f}s but command period={period:.3f}s. "
@@ -288,6 +367,20 @@ def main():
         timeout=0.6,
         verbose=args.verbose_tcp,
     )
+    action_publisher = (
+        TeleopActionPublisher(args.action_stream_host, args.action_stream_port)
+        if args.publish_action_stream
+        else None
+    )
+
+    # ── Tool offset configuration ──────────────────────────────────────────
+    tool_offset_cfg = ToolOffsetConfig(
+        enabled=args.use_gripper_center_pose,
+        xyz_mm=(args.tool_offset_x_mm, args.tool_offset_y_mm, args.tool_offset_z_mm),
+        rpy_deg=(args.tool_offset_rx_deg, args.tool_offset_ry_deg, args.tool_offset_rz_deg),
+        frame_name="gripper_center",
+        controller_tool_offset_already_set=args.controller_tool_offset_already_set,
+    )
 
     command_queue = queue.Queue()
     start_keyboard_thread(command_queue)
@@ -299,12 +392,22 @@ def main():
     last_target_log_time = 0.0
     last_quest_log_time = 0.0
     stop_requested = False
+    last_command_pose = None
+    last_command_joints = None
+    last_sent_joints = None  # for joint-level step limiting (ServoJ path)
+    last_action_stream_log_time = 0.0
 
     print(f"Quest UDP listening on {args.udp_host}:{args.udp_port}")
     print(f"Dobot dashboard target: {args.robot_ip}:{args.dashboard_port}")
     print(f"Servo mode: {args.servo_mode.upper()}")
     print("Rotation composition: tool-frame target_R = origin_R @ delta_R")
     print(f"Mapping: {mapper.mapping_text()}")
+    print(format_tool_offset_config(tool_offset_cfg))
+    if args.servo_mode == "joint":
+        print(
+            f"Joint step limit: {max_joint_step_deg:.2f} deg/step "
+            f"({args.max_joint_speed_deg_s:.1f} deg/s at {args.command_rate:.1f} Hz)"
+        )
     print(
         "Keys: e=align+enable, p=pause, g=GetPose, c=ClearError, "
         "s=Stop, q=quit"
@@ -313,6 +416,8 @@ def main():
         print("WARNING: deadman switch disabled; Quest motion will drive the robot.")
     if args.enable_gripper:
         print("  Gripper enabled: right trigger controls gripper")
+    if action_publisher is not None:
+        print(f"Teleop action stream enabled: udp://{args.action_stream_host}:{args.action_stream_port}")
 
     try:
         if args.dry_run:
@@ -345,7 +450,11 @@ def main():
                         f"from {new_pose.address[0]}:{new_pose.address[1]}"
                     )
                     if args.auto_enable and not enabled:
-                        enabled = enable_teleop(client, mapper, latest_pose, args)
+                        enabled, robot_joints = enable_teleop(client, mapper, latest_pose, args)
+                        if enabled:
+                            last_command_pose = list(mapper._last_target)
+                            last_command_joints = None
+                            last_sent_joints = robot_joints
 
             # -- keyboard commands -------------------------------------------
             while True:
@@ -355,9 +464,14 @@ def main():
                     break
 
                 if key == "e":
-                    enabled = enable_teleop(client, mapper, latest_pose, args)
+                    enabled, robot_joints = enable_teleop(client, mapper, latest_pose, args)
+                    if enabled:
+                        last_command_pose = list(mapper._last_target)
+                        last_command_joints = None
+                        last_sent_joints = robot_joints
                 elif key == "p":
                     enabled = False
+                    last_command_pose = None
                     if args.dry_run:
                         print("Teleop paused. DRY RUN: Stop skipped.")
                     else:
@@ -382,12 +496,14 @@ def main():
                         print(client.clear_error())
                 elif key == "s":
                     enabled = False
+                    last_command_pose = None
                     if args.dry_run:
                         print("DRY RUN: Stop skipped.")
                     else:
                         print(client.stop())
                 elif key == "q":
                     enabled = False
+                    last_command_pose = None
                     stop_requested = True
                     break
                 elif key:
@@ -429,15 +545,19 @@ def main():
                 rg_pressed = args.ignore_deadman or rg_val > 0.5
 
                 target, info = mapper.target_from_quest(latest_pose, rg_pressed=rg_pressed)
+                gripper_cmd = QuestTeleopMapper.gripper_from_trigger(latest_pose)
+                command_reference = list(last_command_pose or target)
+                servo_sent = False
 
                 sent_pos = info["sent_step_mm"]
                 sent_rot = info.get("sent_step_deg", 0.0)
                 if should_send_target(info):
                     if not args.dry_run:
                         if args.servo_mode == "joint":
-                            # ---- ServoJ path: IK + joint-limit check ----------
+                            # ── ServoJ path: IK + joint-limit + joint-step guard ─
                             try:
-                                joints = client.inverse_kin(target)
+                                desired_joints = client.inverse_kin(target)
+                                # 不传 joint_near: 控制器默认根据当前关节角就近选解
                             except DobotDashboardError:
                                 print(
                                     f"IK unsolvable for {format_pose(target)}, "
@@ -446,7 +566,7 @@ def main():
                                 )
                                 continue
 
-                            ok, limit_msg = check_joint_limits(joints)
+                            ok, limit_msg = check_joint_limits(desired_joints)
                             if not ok:
                                 print(
                                     f"Joint-limit skip: {limit_msg}  "
@@ -454,9 +574,31 @@ def main():
                                 )
                                 continue
 
+                            # ── Joint-level step limiting (prevents IK-branch
+                            #     jumps near singularities from slamming the robot)
+                            if last_sent_joints is None:
+                                try:
+                                    last_sent_joints = client.get_angle()
+                                except DobotDashboardError:
+                                    last_sent_joints = list(desired_joints)
+
+                            planned_joints, joint_step, joint_limited = plan_joint_step(
+                                list(desired_joints),
+                                list(last_sent_joints),
+                                max_joint_step_deg,
+                            )
+
+                            ok2, limit_msg2 = check_joint_limits(planned_joints)
+                            if not ok2:
+                                print(
+                                    f"Joint-limit skip after rate limit: {limit_msg2}  "
+                                    f"planned=[{format_joints(planned_joints)}]"
+                                )
+                                continue
+
                             try:
                                 client.servoj(
-                                    joints,
+                                    planned_joints,
                                     t=args.servo_t,
                                     aheadtime=args.servo_aheadtime,
                                     gain=args.servo_gain,
@@ -469,11 +611,28 @@ def main():
                                 print(
                                     f"ServoJ rejected: "
                                     f"target={format_pose(target)}, "
-                                    f"joints=[{format_joints(joints)}], "
+                                    f"planned_joints=[{format_joints(planned_joints)}], "
+                                    f"desired_joints=[{format_joints(desired_joints)}], "
                                     f"robot_mode={mode}, "
                                     f"response={exc}, skipping"
                                 )
+                                if mode == 11:
+                                    try:
+                                        print("  ↳ robot_mode=11 (COLLISION), auto-clearing...")
+                                        client.clear_error()
+                                        print("  ↳ ClearError OK.")
+                                    except DobotDashboardError as ce:
+                                        print(f"  ↳ ClearError also failed: {ce}")
                                 continue
+                            last_sent_joints = list(planned_joints)
+                            last_command_joints = list(planned_joints)
+                            servo_sent = True
+                            if joint_limited:
+                                print(
+                                    f"Joint step clipped: max_step={joint_step:.2f}° "
+                                    f"desired=[{format_joints(desired_joints)}] → "
+                                    f"planned=[{format_joints(planned_joints)}]"
+                                )
                         else:
                             # ---- ServoP path (original) ----------------------
                             try:
@@ -507,11 +666,9 @@ def main():
                                     "skipping"
                                 )
                                 continue
+                            servo_sent = True
                         # Gripper
                         if args.enable_gripper:
-                            gripper_cmd = QuestTeleopMapper.gripper_from_trigger(
-                                latest_pose
-                            )
                             # Dobot gripper typically uses 0-100 range;
                             # scale from [0,1] to [0,100] and clamp.
                             gripper_val = clamp(gripper_cmd * 100.0, 0.0, 100.0)
@@ -521,6 +678,35 @@ def main():
                             # For simplicity we send it as part of the pose if
                             # the firmware supports 7-DOF.
                             pass  # TODO: implement dobot gripper command
+
+                if servo_sent:
+                    action = _base_frame_pose_delta(command_reference, target) + [gripper_cmd]
+                    last_command_pose = list(target)
+                else:
+                    # Do not label an unsent mapper target as a robot action.
+                    action = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, gripper_cmd]
+
+                if action_publisher is not None:
+                    stream_action = TeleopAction(
+                        timestamp=time.time(),
+                        seq=action_publisher.next_seq(),
+                        source="quest_servop_teleop" if args.servo_mode == "cartesian" else "quest_servoj_teleop",
+                        action=tuple(action),
+                        current_pose=tuple(command_reference),
+                        target_pose=tuple(target),
+                        current_joints=None if last_command_joints is None else tuple(last_command_joints),
+                        deadman=rg_pressed,
+                        servo_sent=servo_sent,
+                        gripper_command=gripper_cmd,
+                    )
+                    published = action_publisher.publish(stream_action)
+                    if now - last_action_stream_log_time >= 1.0:
+                        print(
+                            f"Published action seq={stream_action.seq} sent={servo_sent} "
+                            f"deadman={rg_pressed} action={stream_action.action} "
+                            f"udp={'ok' if published else 'dropped'}"
+                        )
+                        last_action_stream_log_time = now
 
                 if args.log_targets and now - last_target_log_time >= 0.5:
                     grip_str = ""
@@ -578,6 +764,8 @@ def main():
                 pass
             client.close()
         receiver.close()
+        if action_publisher is not None:
+            action_publisher.close()
         print("Direct teleop stopped.")
 
 

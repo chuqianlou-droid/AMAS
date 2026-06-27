@@ -243,6 +243,51 @@ class ToolFrameQuestTeleopMapper:
         )
         self._origin_delta_base_rot = self._accum_delta_rot.copy()
 
+    def sync_accum_to_pose(self, target_pose: List[float]) -> None:
+        """Reset accumulated position AND rotation delta so raw_target matches
+        ``target_pose``.
+
+        Call this on clutch (RG press) to eliminate governor lag: the raw
+        mapper target snaps to the current robot command pose, and the next
+        Quest delta starts from there.
+
+        Also syncs ``_last_target`` to the canonical Euler representation
+        used by ``target_from_quest``, preventing spurious angular
+        differences caused by Euler-angle non-uniqueness
+        (e.g. −172° vs 8° for the same rotation matrix).
+        """
+        if self.robot_origin is None:
+            return
+        # Position sync
+        self._accum_delta_pos = np.array(
+            [
+                target_pose[0] - self.robot_origin[0],
+                target_pose[1] - self.robot_origin[1],
+                target_pose[2] - self.robot_origin[2],
+            ],
+            dtype=float,
+        )
+        # Rotation sync: compute the rotvec delta between origin_R and target_R.
+        # target_R = origin_R @ delta_R  →  delta_R = origin_R^T @ target_R
+        origin_R = self._euler_deg_to_R(self.robot_origin[3:])
+        target_R = self._euler_deg_to_R(target_pose[3:])
+        delta_R = origin_R.T @ target_R
+        self._accum_delta_rot = R.from_matrix(delta_R).as_rotvec()
+        self._origin_delta_base_rot = self._accum_delta_rot.copy()
+        # Sync _last_target to the canonical Euler representation so that
+        # _info_for_target's angle_diff_deg won't see a spurious jump.
+        canonical_euler = R.from_matrix(origin_R @ R.from_rotvec(self._accum_delta_rot).as_matrix()).as_euler(
+            "XYZ", degrees=True
+        )
+        self._last_target = [
+            target_pose[0],
+            target_pose[1],
+            target_pose[2],
+            float(canonical_euler[0]),
+            float(canonical_euler[1]),
+            float(canonical_euler[2]),
+        ]
+
     @staticmethod
     def _quat_pos_to_T(pos: List[float], quat: List[float]) -> np.ndarray:
         """4×4 rigid transform from [x,y,z] and [qx,qy,qz,qw]."""

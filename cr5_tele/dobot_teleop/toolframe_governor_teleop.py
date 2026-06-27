@@ -26,6 +26,11 @@ from dobot_teleop.dobot_dashboard import (
 )
 from dobot_teleop.quest_udp import QuestUdpReceiver
 from dobot_teleop.toolframe_mapping import QuestTeleopConfig, QuestTeleopMapper
+from dobot_teleop.teleop_action_stream import TeleopAction, TeleopActionPublisher
+from dobot_teleop.transforms import (
+    ToolOffsetConfig,
+    format_tool_offset_config,
+)
 
 from servoj_toolframe_teleop import (
     check_joint_limits,
@@ -55,6 +60,15 @@ def pose_delta_mm_deg(a: List[float], b: List[float]) -> Tuple[float, float]:
     R_err = R_a.T @ R_b
     rot_delta = math.degrees(float(np.linalg.norm(R.from_matrix(R_err).as_rotvec())))
     return pos_delta, rot_delta
+
+
+def pose_action_delta_mm_deg(reference: List[float], target: List[float]) -> List[float]:
+    """Return a base-frame 6D target delta in the recorder's mm/degree units."""
+    position = [float(target[index] - reference[index]) for index in range(3)]
+    reference_R = R.from_euler("XYZ", reference[3:], degrees=True).as_matrix()
+    target_R = R.from_euler("XYZ", target[3:], degrees=True).as_matrix()
+    rotation = R.from_matrix(target_R @ reference_R.T).as_euler("XYZ", degrees=True)
+    return [*position, *map(float, rotation)]
 
 
 class PgeModbusGripper:
@@ -302,6 +316,83 @@ class CartesianTargetGovernor:
         return lag_pos, lag_rot
 
 
+class CartesianSafetyEnvelope:
+    """Clamp Cartesian targets to the same static safety fence as teleop.
+
+    ``QuestTeleopMapper`` already applies these limits while mapping Quest
+    poses.  Other command sources (for example an autonomous policy) do not
+    go through that mapper, so this small reusable wrapper keeps the workspace
+    and total-displacement checks identical instead of introducing a second,
+    unrelated safety policy.
+
+    Poses use the Dobot Dashboard convention: XYZ in mm and Rx/Ry/Rz in
+    degrees, with XYZ Euler angle order matching ``QuestTeleopMapper``.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_total_translation_mm: float,
+        max_total_rotation_deg: float,
+        workspace_min_x_mm: float,
+        workspace_max_x_mm: float,
+        workspace_min_y_mm: float,
+        workspace_max_y_mm: float,
+        workspace_min_z_mm: float,
+        workspace_max_z_mm: float,
+    ):
+        # Match QuestTeleopMapper._cap_norm(): a non-positive total limit
+        # disables that particular origin-relative fence.
+        self.max_total_translation_mm = max_total_translation_mm
+        self.max_total_rotation_deg = max_total_rotation_deg
+        self.workspace_min = np.array(
+            [workspace_min_x_mm, workspace_min_y_mm, workspace_min_z_mm],
+            dtype=float,
+        )
+        self.workspace_max = np.array(
+            [workspace_max_x_mm, workspace_max_y_mm, workspace_max_z_mm],
+            dtype=float,
+        )
+        if np.any(self.workspace_min > self.workspace_max):
+            raise ValueError("workspace minimum must not exceed workspace maximum")
+        self._origin_pos: Optional[np.ndarray] = None
+        self._origin_R: Optional[np.ndarray] = None
+
+    def reset(self, robot_pose: List[float]) -> None:
+        if len(robot_pose) != 6:
+            raise ValueError("robot pose must contain 6 values")
+        self._origin_pos = np.asarray(robot_pose[:3], dtype=float)
+        self._origin_R = R.from_euler("XYZ", robot_pose[3:], degrees=True).as_matrix()
+
+    def apply(self, raw_target: List[float]) -> List[float]:
+        """Return a finite, workspace- and origin-bounded Cartesian target."""
+        if self._origin_pos is None or self._origin_R is None:
+            raise RuntimeError("CartesianSafetyEnvelope.reset() must be called first")
+        if len(raw_target) != 6 or not np.all(np.isfinite(raw_target)):
+            raise ValueError("target pose must contain six finite values")
+
+        position = np.asarray(raw_target[:3], dtype=float)
+        delta = position - self._origin_pos
+        delta_norm = float(np.linalg.norm(delta))
+        if (
+            self.max_total_translation_mm > 0.0
+            and delta_norm > self.max_total_translation_mm
+        ):
+            delta *= self.max_total_translation_mm / delta_norm
+        position = self._origin_pos + delta
+        position = np.clip(position, self.workspace_min, self.workspace_max)
+
+        target_R = R.from_euler("XYZ", raw_target[3:], degrees=True).as_matrix()
+        relative_rotvec = R.from_matrix(self._origin_R.T @ target_R).as_rotvec()
+        relative_angle = float(np.linalg.norm(relative_rotvec))
+        max_angle = math.radians(self.max_total_rotation_deg)
+        if max_angle > 0.0 and relative_angle > max_angle:
+            relative_rotvec *= max_angle / relative_angle
+        limited_R = self._origin_R @ R.from_rotvec(relative_rotvec).as_matrix()
+        euler = R.from_matrix(limited_R).as_euler("XYZ", degrees=True)
+        return [*map(float, position), *map(float, euler)]
+
+
 class TimingStats:
     def __init__(self):
         self.count = 0
@@ -424,6 +515,15 @@ def parse_args():
     parser.add_argument("--log-quest", action="store_true")
     parser.add_argument("--verbose-tcp", action="store_true")
     parser.add_argument("--ignore-deadman", action="store_true")
+    parser.add_argument("--publish-action-stream", action="store_true",
+                        help="Publish latest-only CR5A 7D actions for the read-only PI0 recorder")
+    parser.add_argument("--action-stream-host", default="127.0.0.1",
+                        help="UDP host for --publish-action-stream")
+    parser.add_argument("--action-stream-port", type=int, default=5010,
+                        help="UDP port for --publish-action-stream")
+    parser.add_argument("--collision-level", type=int, default=1,
+                        help="Dobot collision detection sensitivity: 0=off, 1~5 (higher=more sensitive). "
+                             "Default 1 for safe teleop. Set 0 to disable temporarily for debugging.")
     parser.add_argument("--enable-gripper", action="store_true")
     parser.add_argument("--gripper-slave-id", type=int, default=1)
     parser.add_argument("--gripper-baud", type=int, default=115200)
@@ -440,6 +540,19 @@ def parse_args():
                         help="PGE init value: 1=single direction, 0xA5=full init")
     parser.add_argument("--gripper-init-timeout", type=float, default=8.0,
                         help="Seconds to wait for PGE init status register 0x0200")
+
+    # ── Tool offset (for action stream metadata) ──────────────────────────
+    parser.add_argument("--use-gripper-center-pose", action="store_true", default=True,
+                        help="Record gripper-center poses in action stream metadata")
+    parser.add_argument("--no-use-gripper-center-pose", action="store_false",
+                        dest="use_gripper_center_pose")
+    parser.add_argument("--tool-offset-x-mm", type=float, default=0.0)
+    parser.add_argument("--tool-offset-y-mm", type=float, default=0.0)
+    parser.add_argument("--tool-offset-z-mm", type=float, default=160.0)
+    parser.add_argument("--tool-offset-rx-deg", type=float, default=0.0)
+    parser.add_argument("--tool-offset-ry-deg", type=float, default=0.0)
+    parser.add_argument("--tool-offset-rz-deg", type=float, default=0.0)
+    parser.add_argument("--controller-tool-offset-already-set", action="store_true")
 
     return parser.parse_args()
 
@@ -538,7 +651,21 @@ def main():
         timeout=0.6,
         verbose=args.verbose_tcp,
     )
+    action_publisher = (
+        TeleopActionPublisher(args.action_stream_host, args.action_stream_port)
+        if args.publish_action_stream
+        else None
+    )
     gripper = None
+
+    # ── Tool offset configuration ──────────────────────────────────────────
+    tool_offset_cfg = ToolOffsetConfig(
+        enabled=args.use_gripper_center_pose,
+        xyz_mm=(args.tool_offset_x_mm, args.tool_offset_y_mm, args.tool_offset_z_mm),
+        rpy_deg=(args.tool_offset_rx_deg, args.tool_offset_ry_deg, args.tool_offset_rz_deg),
+        frame_name="gripper_center",
+        controller_tool_offset_already_set=args.controller_tool_offset_already_set,
+    )
 
     command_queue = queue.Queue()
     start_keyboard_thread(command_queue)
@@ -546,6 +673,7 @@ def main():
     enabled = False
     latest_pose = None
     first_pose_printed = False
+    was_rg_pressed = False
     last_status_time = time.monotonic()
     last_target_log_time = 0.0
     last_quest_log_time = 0.0
@@ -555,12 +683,14 @@ def main():
     joint_lag_active = False
     ik_timing = TimingStats()
     servo_timing = TimingStats()
+    last_action_stream_log_time = 0.0
 
     print(f"Quest UDP listening on {args.udp_host}:{args.udp_port}")
     print(f"Dobot dashboard target: {args.robot_ip}:{args.dashboard_port}")
     print(f"Servo mode: {args.servo_mode.upper()}")
     print("Rotation composition: tool-frame target_R = origin_R @ delta_R")
     print(f"Mapping: {mapper.mapping_text()}")
+    print(format_tool_offset_config(tool_offset_cfg))
     print(
         "Governor: "
         f"linear={args.max_linear_speed_mm_s:.1f}mm/s "
@@ -580,6 +710,8 @@ def main():
             "Gripper enabled: Quest right trigger controls PGE gripper "
             f"(threshold={args.gripper_trigger_threshold:.2f})"
         )
+    if action_publisher is not None:
+        print(f"Teleop action stream enabled: udp://{args.action_stream_host}:{args.action_stream_port}")
 
     try:
         if args.dry_run:
@@ -591,6 +723,8 @@ def main():
                 print(client.clear_error())
             if args.enable_robot:
                 print(client.enable_robot())
+            if args.collision_level is not None:
+                print(client.set_collision_level(args.collision_level))
             if args.enable_gripper:
                 gripper = PgeModbusGripper(
                     client=client,
@@ -710,6 +844,12 @@ def main():
                 rg_val = latest_pose.buttons.get("RG", 0.0)
                 rg_pressed = args.ignore_deadman or rg_val > 0.5
 
+                # ── 离合器: RG按下瞬间，消除governor追赶滞后 ──────
+                if rg_pressed and not was_rg_pressed:
+                    mapper.sync_accum_to_pose(governor.current_target())
+                    print(f"  ↳ clutch: mapper synced to governor cmd={format_pose(governor.current_target())}")
+                was_rg_pressed = rg_pressed
+
                 raw_target, info = mapper.target_from_quest(
                     latest_pose, rg_pressed=rg_pressed
                 )
@@ -724,6 +864,7 @@ def main():
                         prev_cmd_target, cmd_target
                     )
                 else:
+                    prev_cmd_target = governor.current_target()
                     cmd_target = governor.current_target()
                     cmd_lag_pos, cmd_lag_rot = 0.0, 0.0
                     cmd_step_pos, cmd_step_rot = 0.0, 0.0
@@ -744,12 +885,17 @@ def main():
                 joint_step = 0.0
                 ik_ms = None
                 servo_ms = None
+                servo_sent = False
+                stream_current_joints = (
+                    None if last_sent_joints is None else list(last_sent_joints)
+                )
 
                 if send_target and not args.dry_run:
                     if args.servo_mode == "joint":
                         try:
                             t0 = time.perf_counter()
                             desired_joints = client.inverse_kin(cmd_target)
+                            # 不传 joint_near: 控制器默认根据当前关节角就近选解
                             ik_ms = (time.perf_counter() - t0) * 1000.0
                             ik_timing.add(ik_ms)
                         except DobotDashboardError:
@@ -797,6 +943,7 @@ def main():
                             servo_ms = (time.perf_counter() - t0) * 1000.0
                             servo_timing.add(servo_ms)
                             last_sent_joints = planned_joints
+                            servo_sent = True
                         except DobotDashboardError as exc:
                             try:
                                 mode = client.robot_mode()
@@ -809,6 +956,14 @@ def main():
                                 f"planned=[{format_joints(planned_joints)}], "
                                 f"robot_mode={mode}, response={exc}, skipping"
                             )
+                            # Auto-clear collision mode so teleop can continue
+                            if mode == 11:
+                                try:
+                                    print("  ↳ robot_mode=11 (COLLISION), auto-clearing...")
+                                    client.clear_error()
+                                    print("  ↳ ClearError OK, robot should resume.")
+                                except DobotDashboardError as ce:
+                                    print(f"  ↳ ClearError also failed: {ce}")
                             continue
                     else:
                         try:
@@ -821,6 +976,7 @@ def main():
                             )
                             servo_ms = (time.perf_counter() - t0) * 1000.0
                             servo_timing.add(servo_ms)
+                            servo_sent = True
                         except DobotDashboardError:
                             try:
                                 mode = client.robot_mode()
@@ -843,12 +999,42 @@ def main():
                             )
                             continue
 
+                gripper_cmd = QuestTeleopMapper.gripper_from_trigger(latest_pose)
                 if args.enable_gripper:
-                    gripper_cmd = QuestTeleopMapper.gripper_from_trigger(latest_pose)
                     if args.dry_run:
                         pass
                     elif gripper is not None:
                         gripper.update_from_trigger(gripper_cmd)
+
+                if servo_sent:
+                    action = pose_action_delta_mm_deg(prev_cmd_target, cmd_target) + [gripper_cmd]
+                else:
+                    # A mapper target that failed validation or was not sent is
+                    # not a valid robot action label.
+                    action = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, gripper_cmd]
+                if action_publisher is not None:
+                    stream_action = TeleopAction(
+                        timestamp=time.time(),
+                        seq=action_publisher.next_seq(),
+                        source="quest_governor_teleop",
+                        action=tuple(action),
+                        current_pose=tuple(prev_cmd_target),
+                        target_pose=tuple(cmd_target),
+                        current_joints=(
+                            None if stream_current_joints is None else tuple(stream_current_joints)
+                        ),
+                        deadman=rg_pressed,
+                        servo_sent=servo_sent,
+                        gripper_command=gripper_cmd,
+                    )
+                    published = action_publisher.publish(stream_action)
+                    if now - last_action_stream_log_time >= 1.0:
+                        print(
+                            f"Published action seq={stream_action.seq} servo_sent={servo_sent} "
+                            f"deadman={rg_pressed} action={stream_action.action} "
+                            f"udp={'ok' if published else 'dropped'}"
+                        )
+                        last_action_stream_log_time = now
 
                 if args.log_targets and now - last_target_log_time >= 0.5:
                     joint_str = ""
@@ -939,6 +1125,8 @@ def main():
                 pass
             client.close()
         receiver.close()
+        if action_publisher is not None:
+            action_publisher.close()
         print("Direct teleop stopped.")
 
 

@@ -146,16 +146,47 @@ class DobotDashboard:
             raise DobotDashboardError(f"GetAngle returned no joint values: {response}")
         return values[:6]
 
-    def inverse_kin(self, pose_mm_deg: Iterable[float]) -> List[float]:
+    def inverse_kin(
+        self,
+        pose_mm_deg: Iterable[float],
+        joint_near: Optional[Iterable[float]] = None,
+    ) -> List[float]:
+        """Compute IK, optionally selecting the solution nearest to ``joint_near``.
+
+        Without ``joint_near`` the controller defaults to the robot's current
+        joint angles for solution selection (useJointNear=0).  Passing
+        ``joint_near`` explicitly uses ``useJointNear=1`` with your
+        reference joints, which is more robust for high-frequency servo
+        where the controller's real-time joint state may lag.
+        """
         pose = list(pose_mm_deg)
         if len(pose) != 6:
             raise ValueError("InverseKin pose must contain 6 values")
-        response = self._api.InverseKin(*pose)
+
+        if joint_near is not None:
+            jn = list(joint_near)
+            if len(jn) != 6:
+                raise ValueError("joint_near must contain 6 values")
+            response = self._api.InverseKin(
+                *pose,
+                useJointNear=1,
+                JointNear=f"{{{jn[0]},{jn[1]},{jn[2]},{jn[3]},{jn[4]},{jn[5]}}}",
+            )
+        else:
+            response = self._api.InverseKin(*pose)
+
         self.require_ok(response, "InverseKin")
         values = self.values(response)
         if len(values) < 6:
             raise DobotDashboardError(f"InverseKin returned no joint values: {response}")
         return values[:6]
+
+    def set_collision_level(self, level: int) -> str:
+        """Set collision detection sensitivity: 0=off, 1~5 (higher=more sensitive)."""
+        if not (0 <= level <= 5):
+            raise ValueError("Collision level must be 0-5")
+        response = self._api.SetCollisionLevel(level)
+        return self.require_ok(response, "SetCollisionLevel")
 
     def get_pose(self, user: Optional[int] = None, tool: Optional[int] = None) -> List[float]:
         if user is None and tool is None:

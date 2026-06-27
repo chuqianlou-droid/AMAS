@@ -10,7 +10,16 @@
       "Bash(cp /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop/servop_teleop.py /home/jiaotan/Workspace/cr5_tele/dobot_teleop/servop_teleop.py)",
       "Bash(cp /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop/dobot_teleop/dobot_dashboard.py /home/jiaotan/Workspace/cr5_tele/dobot_teleop/dobot_teleop/dobot_dashboard.py)",
       "Bash(cp dobot_teleop/servop_teleop.py /home/jiaotan/Workspace/cr5_tele/dobot_teleop/servop_teleop.py)",
-      "Bash(cp dobot_teleop/dobot_teleop/dobot_dashboard.py /home/jiaotan/Workspace/cr5_tele/dobot_teleop/dobot_teleop/dobot_dashboard.py)"
+      "Bash(cp dobot_teleop/dobot_teleop/dobot_dashboard.py /home/jiaotan/Workspace/cr5_tele/dobot_teleop/dobot_teleop/dobot_dashboard.py)",
+      "Bash(conda info *)",
+      "Bash(/home/jiaotan/dobot_ws/src/AMAS/cr5_tele/openpi/.venv/bin/python *)",
+      "Bash(conda activate *)",
+      "Bash(/home/jiaotan/dobot_ws/src/AMAS/cr5_tele/openpi/.venv/bin/python3 -c \"import pyrealsense2; print\\('OK'\\)\")",
+      "Bash(dpkg -l)",
+      "Bash(conda run *)",
+      "Bash(pip install *)",
+      "Bash(/home/jiaotan/openpi/.venv/bin/python3 -c \"from PIL import Image; print\\('OK'\\)\")",
+      "Bash(/home/jiaotan/openpi/.venv/bin/pip install *)"
     ]
   }
 }

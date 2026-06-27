@@ -1,6 +1,51 @@
-# Quest3 → Dobot CR5 直连遥操作
+# Quest3 → Dobot CR5 直连遥操作 + VLA 数据采集
 
 不走 ROS2，通过 UDP 直连 Quest 3，TCP 直连 Dobot 控制器。
+
+## 目录结构
+
+```
+dobot_teleop/
+├── README.md                           ← 本文件
+├── servoj_teleop.py                    ← 遥操作：ServoJ 关节伺服（默认入口）
+├── servoj_toolframe_teleop.py          ← 遥操作：工具坐标系姿态映射版
+├── toolframe_governor_teleop.py        ← 遥操作：工具坐标系 + 在线速度规划器
+│
+├── scripts/
+│   ├── dataset/
+│   │   ├── record_cr5a_pi0_dataset.py  ← VLA 数据录制（支持 raw / LeRobot 双格式）
+│   │   ├── inspect_cr5a_pi0_dataset.py ← 检查录制好的 episode
+│   │   └── convert_to_lerobot.py       ← 批量转换 raw → LeRobot 格式
+│   └── bridge/
+│       └── pi0_cr5a_bridge.py          ← OpenPI / π0 模型 → CR5A 桥接
+│
+├── dobot_teleop/                       ← Python 包（共享模块）
+│   ├── __init__.py
+│   ├── dobot_dashboard.py              ← Dobot TCP 封装 (ServoJ, ServoP, GetPose 等)
+│   ├── quest_udp.py                    ← Quest UDP 接收 + 按钮解析
+│   ├── teleop_mapping.py               ← 遥操作映射：坐标系变换/滤波/限幅（关节空间）
+│   ├── toolframe_mapping.py            ← 遥操作映射：工具坐标系版本
+│   ├── transforms.py                   ← 工具偏移变换：TCP ↔ gripper_center
+│   ├── cr5a_pi0_schema.py             ← CR5A 观测 / 7D action 数据规范
+│   ├── realsense_dual_rgb_provider.py  ← D415 + D435 双路 RGB provider
+│   ├── teleop_action_stream.py         ← 遥操作 action 的 UDP 发布/订阅
+│   └── lerobot_writer.py              ← LeRobot v2.1 格式写入器
+│
+├── scripts/
+│   ├── dataset/
+│   │   ├── record_cr5a_pi0_dataset.py  ← VLA 数据录制（支持 raw / LeRobot 双格式）
+│   │   ├── inspect_cr5a_pi0_dataset.py ← 检查录制好的 episode
+│   │   └── convert_to_lerobot.py       ← 批量转换 raw → LeRobot 格式
+│   ├── bridge/
+│   │   └── pi0_cr5a_bridge.py          ← OpenPI / π0 模型 → CR5A 桥接
+│   └── test_tool_offset_transform.py   ← 工具偏移变换单元测试
+│
+├── tests/                              ← 单元测试
+├── datasets/                           ← 数据目录（录制输出）
+└── __pycache__/                        ← (已 gitignore)
+```
+
+---
 
 ## 整体架构
 
@@ -35,55 +80,6 @@
 └─────────────────────┘    └──────────────────────────┘
 ```
 
-## 核心处理流程（参考 lerobot_franka_teleop）
-
-```
-Quest 手柄原始位姿 (x,y,z, qx,qy,qz,qw)
-  │
-  ├─[可选] EMA 滤波器 (位置 + 旋转 rotvec)
-  │
-  ├─ 计算增量（两种模式可选）:
-  │   ├─ 帧间差分 (默认, 推荐) — 每帧 ∆ = 当前 - 上一帧
-  │   │   RG 松手 → 清零 ∆，防抖动跳变
-  │   │   RG 握住 → 累加 ∆，平滑跟随
-  │   │
-  │   └─ 原点差分 — ∆ = 当前 - 复位原点
-  │
-  ├─ Oculus → Robot 坐标系变换 (3×3 矩阵)
-  │   默认: robot_x = -oculus_x
-  │         robot_y = -oculus_z
-  │         robot_z = +oculus_y
-  │
-  ├─ 缩放 (位置 + 旋转独立缩放)
-  │
-  ├─ 每轴符号翻转
-  │
-  ├─ 总位移限幅 / 工作空间限幅
-  │
-  └─ 死区 + 每步限幅 → 笛卡尔目标位姿
-       (x, y, z 单位 mm; rx, ry, rz 单位 °)
-       │
-       ▼
-  InverseKin → 关节限幅检查 (±0.5° 安全裕量)
-       │
-       ▼
-  ServoJ(J1..J6, t, aheadtime, gain)
-```
-
-### 与 ROS2 方案的关键区别
-
-| 特性 | ROS2 (quest3_cr5_servop_teleop) | 本方案 |
-|------|--------------------------------|--------|
-| 自由度 | **3-DOF** (位置 only，旋转锁定) | **6-DOF** (位置 + 四元数旋转) |
-| 增量方式 | 原点差分 | 帧间差分 (默认) / 原点差分 |
-| 死人开关 | ❌ 无 | ✅ RG 按键控制 |
-| 夹爪 | ❌ 无 | ✅ 右扳机 |
-| 平滑方式 | EMA(0.80) + 速度/加速度规划器 | EMA (可配置) + 步长限幅 |
-| 延迟 | ~500-800ms (双层平滑叠加) | ~50-150ms (无规划器) |
-| 依赖 | ROS2 Humble + dobot_bringup | Python3 + numpy + scipy |
-
----
-
 ## 环境要求
 
 - **Python 3.10+** (系统自带即可)
@@ -93,193 +89,218 @@ Quest 手柄原始位姿 (x,y,z, qx,qy,qz,qw)
 pip install numpy scipy
 ```
 
+CR5A PI0 数据采集还需要：
+
+```bash
+pip install Pillow pyrealsense2
+```
+
+LeRobot 格式需要（仅在 recording/convert 时需要）：
+
+```bash
+pip install datasets pyarrow
+```
+
 - **TCP-IP-Python-V4** — Dobot 官方 SDK，放在 `cr5_tele/` 下
   - 路径: `/home/jiaotan/dobot_ws/src/AMAS/cr5_tele/TCP-IP-Python-V4/dobot_api.py`
 
 ---
 
-## VR 端准备
+## 快速开始
 
-1. **Quest 3 头显**
-   - 已安装 Unity App `com.sjtu.questcr5teleop`
-   - 与电脑在**同一 WiFi 网络**下
+### 测试连接
 
-2. **在 App 中配置电脑 IP**
-   - 电脑上执行 `ip a` 或 `ifconfig` 查看 IP
-   - 在 Quest App 界面中输入该 IP 地址
-   - App 会向该 IP 的 UDP 5005 端口发送手柄数据
+```bash
+cd /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop
+python3 tests/servop_test_direct.py --robot-ip 192.168.5.1 --dx 10 --enable-robot
+```
 
-3. **启动 App**
-   - 方法 A: 头显中手动点开
-   - 方法 B: ADB 自动启动
-     ```bash
-     adb shell monkey -p com.sjtu.questcr5teleop 1
-     ```
-   - 如果 ADB 权限不允许，手动打开即可
+### 启动遥操作（已调试参数 ✅）
 
----
-
-## 使用步骤
-
-### 1. 快速测试：单步 ServoP 验证
-
-先确认电脑能连到机械臂:
+**推荐入口 — 在线速度规划器版本**：
 
 ```bash
 cd /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop
 
-python3 servop_test_direct.py \
+python3 toolframe_governor_teleop.py \
   --robot-ip 192.168.5.1 \
-  --dx 10 \
-  --speed-mm-s 50 \
-  --enable-robot
+  --enable-robot --clear-error --auto-enable \
+  --log-targets --log-joints --log-timing --log-quest \
+  --servo-mode joint \
+  --command-rate 50 --servo-t 0.03 --servo-gain 700 --servo-aheadtime 65 \
+  --rotation-mode frame-delta \
+  --position-scale 0.80 --rotation-scale 0.30 \
+  --filter-ratio-pos 0.50 --filter-ratio-rot 0.40 \
+  --max-linear-speed-mm-s 35 --max-angular-speed-deg-s 20 --max-joint-speed-deg-s 35 \
+  --collision-level 1 \
+  --enable-gripper
 ```
 
-如果 `--clear-error` 或 `--enable-robot` 返回错误码，说明 TCP 通信正常，但可能需要先手动 ClearError。
-
-### 2. 启动遥操作
-
-默认使用 **ServoJ**（关节空间伺服），IK 预检查 + 关节限幅保护：
-
-```bash
-cd /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop
-
-python3 servoj_teleop.py \
-  --robot-ip 192.168.5.1 \
-  --enable-robot \
-  --auto-enable \
-  --ignore-deadman \
-  --log-targets
-```
-
-如需切回原来的 ServoP（笛卡尔伺服）：
-
-```bash
-python3 servoj_teleop.py --servo-mode cartesian ...
-```
-
-### 2.1 工具坐标系姿态遥操作
-
-如果要让手柄旋转映射为末端工具坐标系旋转，使用新增入口：
+**简化版（ServoJ 关节伺服）**：
 
 ```bash
 python3 servoj_toolframe_teleop.py \
   --robot-ip 192.168.5.1 \
-  --enable-robot \
-  --clear-error \
-  --auto-enable \
-  --ignore-deadman \
-  --log-targets \
-  --log-joints \
+  --enable-robot --clear-error --auto-enable \
+  --log-targets --log-joints \
   --servo-mode joint \
-  --rotation-mode origin-delta \
-  --position-scale 0.20 \
-  --rotation-scale 0.05 \
-  --filter-ratio-pos 0.20 \
-  --filter-ratio-rot 0.0
+  --rotation-mode frame-delta \
+  --position-scale 0.80 --rotation-scale 0.30 \
+  --filter-ratio-pos 0.50 --filter-ratio-rot 0.40
 ```
 
-这个脚本保留原位置映射不变，只把姿态改为 `target_R = origin_R @ delta_R` 的工具坐标系右乘组合。纯旋转时也会发送命令，日志会显示 `step_pos` 和 `step_rot`。
-
-如果要跳过 PC 端 IK 和 ServoJ，直接使用 ServoP 工具坐标系版本：
+**不连机械臂的模拟模式**：
 
 ```bash
-python3 servop_toolframe_teleop.py \
-  --robot-ip 192.168.5.1 \
-  --enable-robot \
-  --clear-error \
-  --auto-enable \
-  --ignore-deadman \
-  --log-targets \
-  --log-joints \
-  --rotation-mode origin-delta \
-  --position-scale 0.20 \
-  --rotation-scale 0.05 \
-  --filter-ratio-pos 0.20 \
-  --filter-ratio-rot 0.0
+python3 toolframe_governor_teleop.py --robot-ip 192.168.5.1 --dry-run
 ```
 
-`servop_toolframe_teleop.py` 会强制使用 ServoP，即使命令行里误传 `--servo-mode joint` 也会忽略。
+---
 
-### 2.2 在线速度规划 / target governor
+## VLA 数据采集（CR5A PI0 / LeRobot）
 
-如果手柄移动时 raw target 跳得比较快，但不想缓存历史手柄点，可以使用 online target governor 版本：
+### 数据格式
+
+| 字段 | Shape | 说明 |
+|------|-------|------|
+| `observation.state` | (7,) | `[j1, j2, j3, j4, j5, j6, gripper]` |
+| `action` | (7,) | `[dx_mm, dy_mm, dz_mm, dRx_deg, dRy_deg, dRz_deg, gripper]` |
+| `observation.images.d415` | (224, 224, 3) | D415 相机 RGB |
+| `observation.images.d435` | (224, 224, 3) | D435 相机 RGB |
+
+> **注意**：`observation.state` 不包含 TCP 位姿。TCP 位姿是关节角度的正向运动学结果，属于冗余信息；action 已经编码了位姿变化，policy 只需观测关节状态即可。
+
+### 方式一：录制时直接输出 LeRobot 格式（推荐）
+
+**终端 1** — 启动遥操作并发布 action stream：
 
 ```bash
+cd /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop
 python3 toolframe_governor_teleop.py \
   --robot-ip 192.168.5.1 \
-  --enable-robot \
-  --clear-error \
-  --auto-enable \
-  --ignore-deadman \
-  --log-targets \
-  --log-joints \
-  --log-timing \
+  --enable-robot --clear-error --auto-enable \
+  --log-targets --log-joints --log-timing --log-quest \
   --servo-mode joint \
-  --command-rate 50 \
-  --servo-t 0.02 \
-  --servo-gain 800 \
-  --servo-aheadtime 70 \
-  --rotation-mode origin-delta \
-  --position-scale 0.80 \
-  --rotation-scale 0.30 \
-  --filter-ratio-pos 0.50 \
-  --filter-ratio-rot 0.40 \
-  --max-linear-speed-mm-s 35 \
-  --max-angular-speed-deg-s 20 \
-  --max-joint-speed-deg-s 35 \
+  --command-rate 50 --servo-t 0.03 --servo-gain 700 --servo-aheadtime 65 \
+  --rotation-mode frame-delta \
+  --position-scale 0.80 --rotation-scale 0.30 \
+  --filter-ratio-pos 0.50 --filter-ratio-rot 0.40 \
+  --max-linear-speed-mm-s 35 --max-angular-speed-deg-s 20 --max-joint-speed-deg-s 35 \
+  --collision-level 1 \
   --enable-gripper \
-  --log-quest
+  --publish-action-stream --action-stream-host 127.0.0.1 --action-stream-port 5010
 ```
 
-这个入口仍然每个周期只取最新 Quest pose，不排队旧手柄点。链路是：
+**终端 2** — 录制数据，直接生成 LeRobot parquet：
+
+```bash
+cd /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop
+python3 scripts/dataset/record_cr5a_pi0_dataset.py \
+  --robot-ip 192.168.5.1 \
+  --output-dir ./datasets/cr5a_lerobot \
+  --format lerobot \
+  --prompt "pick the object" \
+  --duration-sec 30 \
+  --action-source teleop \
+  --teleop-action-host 127.0.0.1 --teleop-action-port 5010 \
+  --teleop-state-source stream \
+  --max-action-age-ms 200 \
+  --record-only-when-deadman --drop-no-action
+```
+
+多次录制到同一个 `--output-dir` 会自动追加 episode。录制完即可直接用于训练，无需转换。
+
+### 方式二：录制 raw 格式再批量转换
+
+录制为 legacy raw 格式：
+
+```bash
+python3 scripts/dataset/record_cr5a_pi0_dataset.py \
+  --robot-ip 192.168.5.1 \
+  --output-dir ./datasets/cr5a_raw \
+  --prompt "pick the object" \
+  --duration-sec 30 \
+  --action-source teleop \
+  --teleop-action-host 127.0.0.1 --teleop-action-port 5010 \
+  --teleop-state-source stream
+```
+
+批量转换为 LeRobot 格式：
+
+```bash
+python3 scripts/dataset/convert_to_lerobot.py \
+  --input-dir ./datasets/cr5a_raw \
+  --output-dir ./datasets/cr5a_lerobot
+```
+
+### 方式三：Mock 录制（无遥操作，测试用）
+
+```bash
+python3 scripts/dataset/record_cr5a_pi0_dataset.py \
+  --robot-ip 192.168.5.1 \
+  --output-dir ./datasets/cr5a_test \
+  --format lerobot \
+  --prompt "pick the object" \
+  --duration-sec 10 \
+  --mock-action zero
+```
+
+### 检查录制的数据
+
+```bash
+# 检查 raw 格式 episode
+python3 scripts/dataset/inspect_cr5a_pi0_dataset.py \
+  --episode-dir ./datasets/cr5a_raw/episode_000000 \
+  --save-preview ./preview.png
+```
+
+### 验证 LeRobot 数据集
+
+```bash
+python3 -c "
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+ds = LeRobotDataset('cr5a_lerobot', root='./datasets/cr5a_lerobot')
+print(f'Episodes: {ds.num_episodes}, Frames: {ds.num_frames}')
+print(f'State: {ds.meta.shapes[\"observation.state\"]}')
+print(f'Action: {ds.meta.shapes[\"action\"]}')
+"
+```
+
+---
+
+## OpenPI / π0 → CR5A 桥接
+
+`scripts/bridge/pi0_cr5a_bridge.py` 将 PI0 输出通过安全路径发送到 CR5A：
 
 ```text
-Quest UDP latest pose
-→ mapper 生成 raw Cartesian target
-→ Cartesian target governor 限速追踪
-→ IK
-→ joint target rate limit
-→ ServoJ / ServoP at fixed command-rate
+OpenPI policy server: {"actions": action_chunk}
+→ action adapter (units / axis map / base-or-tool delta)
+→ CartesianSafetyEnvelope (workspace + displacement + orientation fence)
+→ CartesianTargetGovernor (linear and angular rate limit)
+→ ServoP(X,Y,Z,Rx,Ry,Rz,t,aheadtime,gain)
 ```
 
-### 3. 完整参数示例
-
 ```bash
-python3 servoj_teleop.py \
-  --robot-ip 192.168.5.1 \
-  --enable-robot \
-  --clear-error \
-  --auto-enable \
-  --ignore-deadman \
-  --log-targets \
-  --log-joints \
-  --command-rate 30 \
-  --servo-t 0.03 \
-  --servo-gain 500 \
-  --servo-aheadtime 30 \
-  --servo-mode joint \
-  --position-scale 0.20 \
-  --rotation-scale 0.30 \
-  --filter-ratio-pos 0.20 \
-  --filter-ratio-rot 0.20 \
-  --target-deadband-mm 2.0 \
-  --target-deadband-deg 1.0 \
-  --max-step-mm 4.0 \
-  --max-step-deg 2.0 \
-  --max-total-translation-mm 150.0 \
-  --max-total-rotation-deg 60.0
-```
+cd /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop
 
-### 4. 不连机械臂的模拟模式
-
-```bash
-python3 servoj_teleop.py \
+# Dry-run 验证
+python3 scripts/bridge/pi0_cr5a_bridge.py \
   --robot-ip 192.168.5.1 \
-  --dry-run \
-  --auto-enable \
-  --ignore-deadman \
-  --log-targets
+  --actions-jsonl /path/to/actions.jsonl \
+  --action-format cartesian_delta_mm_deg \
+  --delta-frame tool \
+  --max-actions 10
+
+# 正式执行
+python3 scripts/bridge/pi0_cr5a_bridge.py \
+  --robot-ip 192.168.5.1 \
+  --policy-host 127.0.0.1 --policy-port 8000 \
+  --observation-provider /path/to/cr5a_observation.py:make_observation \
+  --instruction "pick up the object" \
+  --action-format cartesian_delta_mm_deg \
+  --delta-frame tool \
+  --command-rate 10 --max-linear-speed-mm-s 30 --max-angular-speed-deg-s 15 \
+  --clear-error --enable-robot --execute --log-targets
 ```
 
 ---
@@ -295,91 +316,70 @@ python3 servoj_teleop.py \
 | `s` | Stop |
 | `q` | 退出 |
 
----
-
 ## Quest 手柄操作
 
 | 控制器操作 | 功能 |
 |-----------|------|
 | **RG** (右手柄握持键) | **死人开关**：握住才发送运动命令，松手冻结当前位置 |
 | **右扳机** (rightTrig) | **夹爪控制**：0=张开，1=闭合（需 `--enable-gripper`） |
-| **A 键** | 预留复位（当前未实现） |
-| **手柄移动/旋转** | 控制机械臂末端 6-DOF 位姿 |
-
-每次重新按下 RG 时，程序会把当前手柄位姿设为新的手柄原点，但保留最初对齐的机械臂原点和已累计的机器人目标位移，相当于“离合器”操作。
-
-当前 Quest App 如果只发送 `x,y,z,qx,qy,qz,qw`，没有发送 RG 按键字段，启动时需要加 `--ignore-deadman`，否则机械臂会一直认为死人开关未按下。
+| 手柄移动/旋转 | 控制机械臂末端 6-DOF 位姿 |
 
 ---
 
 ## 参数调优
 
-### 伺服参数
+### 伺服参数（已调试 ✅）
 
-| 参数 | 默认值 | 作用 | 调优建议 |
-|------|--------|------|---------|
-| `servo_mode` | `joint` | 伺服模式 | `joint`=ServoJ (推荐)，`cartesian`=ServoP (旧版) |
-| `command_rate` | 10.0 | PC 控制循环频率 (Hz) | 建议 30~50，太低卡顿，太高 TCP 来不及 |
-| `servo_t` | 0.10 | 每步运行时间 (s) | 与 `1/command_rate` 匹配 |
-| `servo_gain` | 500 | PID 的 P 项，关节跟踪力度 | 200~1000，越大越跟手，过大可能震动 |
-| `servo_aheadtime` | 50 | PID 的 D 项，超前补偿 | 20~100，抑制过冲 |
+| 参数 | 调试值 | 默认值 | 作用 | 调优建议 |
+|------|--------|--------|------|---------|
+| `servo_mode` | `joint` | `joint` | 伺服模式 | `joint`=ServoJ (推荐)，IK 预检查 + 关节步长限制 |
+| `command_rate` | **50** | 10.0 | PC 控制循环频率 (Hz) | 50Hz 时 servo_t=0.03s 匹配 |
+| `servo_t` | **0.03** | 0.10 | 每步运行时间 (s) | 与 `1/command_rate` 匹配 |
+| `servo_gain` | **700** | 500 | PID 的 P 项 | 200~1000 |
+| `servo_aheadtime` | **65** | 50 | PID 的 D 项 | 20~100 |
+| `collision_level` | **1** | — | 碰撞检测灵敏度 | 0=关闭, 1~5（越高越灵敏）。**遥操作建议 1**，防止误触发碰撞保护 |
 
-### Online governor 参数
+### Online governor 参数（已调试 ✅）
 
-| 参数 | 默认值 | 作用 |
-|------|--------|------|
-| `max_linear_speed_mm_s` | 30.0 | command target 追 raw target 的最大线速度 |
-| `max_angular_speed_deg_s` | 15.0 | command target 追 raw target 的最大角速度 |
-| `max_joint_speed_deg_s` | 30.0 | ServoJ 模式下每个关节目标的最大角速度 |
-| `log_timing` | 关闭 | 打印 InverseKin 和 ServoJ/ServoP TCP 耗时 |
-| `timing_log_interval` | 2.0 | timing 汇总日志间隔，单位秒 |
+| 参数 | 调试值 | 默认值 | 作用 |
+|------|--------|--------|------|
+| `max_linear_speed_mm_s` | **35** | 30.0 | command target 追 raw target 的最大线速度 |
+| `max_angular_speed_deg_s` | **20** | 15.0 | 最大角速度 |
+| `max_joint_speed_deg_s` | **35** | 30.0 | ServoJ 模式下每个关节目标的最大角速度（防奇异抖动） |
 
-每周期实际步长由控制周期自动换算：
+### 基本映射参数（已调试 ✅）
 
-```text
-max_pos_step_mm = max_linear_speed_mm_s * (1 / command_rate)
-max_rot_step_deg = max_angular_speed_deg_s * (1 / command_rate)
-max_joint_step_deg = max_joint_speed_deg_s * (1 / command_rate)
-```
-
-### 基本调参
-
-| 参数 | 默认值 | 作用 | 调优建议 |
-|------|--------|------|---------|
-| `position_scale` | 0.20 | 手柄位移 → 机器人位移比例 | 0.10~0.50，越大越灵敏 |
-| `rotation_scale` | 0.50 | 手柄旋转 → 机器人旋转比例 | 建议从 0.05~0.30 开始，旋转太大容易奇异 |
-| `rotation_mode` | `frame-delta` | 姿态映射方式 | 帧间累积（平滑），`origin-delta` 直接映射 |
-| `filter_ratio_pos` | 0.0 | 位置 EMA 滤波比例 | 0.20 可平滑抖动，越大越滞后 |
-| `filter_ratio_rot` | 0.0 | 旋转 EMA 滤波比例 | 0.20 可平滑抖动 |
+| 参数 | 调试值 | 默认值 | 作用 |
+|------|--------|--------|------|
+| `position_scale` | **0.80** | 0.20 | 手柄位移 → 机器人位移比例 |
+| `rotation_scale` | **0.30** | 0.50 | 手柄旋转 → 机器人旋转比例 |
+| `rotation_mode` | **`frame-delta`** | `frame-delta` | 帧间累积（平滑）；`origin-delta` 直接映射 |
+| `filter_ratio_pos` | **0.50** | 0.0 | 位置 EMA 滤波比例 (0=关闭, 0.5=中等平滑) |
+| `filter_ratio_rot` | **0.40** | 0.0 | 旋转 EMA 滤波比例 (0=关闭, 0.4=中等平滑) |
 
 ### 安全限幅
 
 | 参数 | 默认值 | 作用 |
 |------|--------|------|
-| `target_deadband_mm` | 2.0 | 增量 < 此值不发送命令 (防抖动) |
+| `target_deadband_mm` | 2.0 | 增量 < 此值不发送命令 |
 | `target_deadband_deg` | 1.0 | 旋转死区 |
-| `max_step_mm` | 6.0 | 单周期最大位移 |
-| `max_step_deg` | 3.0 | 单周期最大旋转 |
-| `max_total_translation_mm` | 120.0 | 从复位点最大总位移 |
+| `max_step_mm` | 0.8 | 单周期最大位移（raw mapper 内部） |
+| `max_step_deg` | 0.50 | 单周期最大旋转（raw mapper 内部） |
+| `max_total_translation_mm` | 500.0 | 从复位点最大总位移（governor 版本默认更大） |
 | `max_total_rotation_deg` | 90.0 | 从复位点最大总旋转 |
-| `workspace_min/max_*` | ±700等 | 笛卡尔工作空间硬限位 |
 
-### ServoJ 关节限幅
+### 工具偏移（gripper_center）
 
-ServoJ 模式下，PC 端 IK 解算后自动检查关节角，**单边预留 0.5° 安全裕量**：
+| 参数 | 默认值 | 作用 |
+|------|--------|------|
+| `--use-gripper-center-pose` | true | 数据集记录 gripper_center 位姿 |
+| `--tool-offset-z-mm` | 160.0 | TCP 局部 Z 轴偏移量 |
+| `--controller-tool-offset-already-set` | false | 控制器已设工具偏移则跳过软件变换 |
+| `--log-pose-diff` | false | 1Hz 打印 raw_tcp vs gripper_center 差异 |
 
-| 关节 | 机械限位 | 安全范围 |
-|------|---------|---------|
-| J1 | ±360° | ±359.5° |
-| J2 | ±360° | ±359.5° |
-| J3 | ±160° | ±159.5° |
-| J4 | ±360° | ±359.5° |
-| J5 | ±360° | ±359.5° |
-| J6 | ±360° | ±359.5° |
+---
 
-超出安全范围 → 跳过该步，不崩溃。
-
-### 坐标系变换
+## 坐标系变换
 
 默认映射:
 ```
@@ -397,78 +397,11 @@ robot_z = +oculus_y
 
 ---
 
-## 运行模式
-
-### ServoJ 关节伺服 (默认)
-
-```bash
-# 默认就是 joint，不需要额外参数
-python3 servoj_teleop.py --robot-ip 192.168.5.1 ...
-```
-
-特点:
-- PC 端 IK 解算 + 关节限幅预检查，不会因 IK 失败导致机械臂急停
-- 无奇异点问题（J5≈0° 不会红光）
-- 单边 0.5° 安全裕量，超限自动跳过
-- 2 次 TCP 往返/周期（IK + ServoJ），建议 `--command-rate 30`
-
-### ServoP 笛卡尔伺服 (旧版)
-
-```bash
-python3 servoj_teleop.py --robot-ip 192.168.5.1 --servo-mode cartesian ...
-```
-
-特点:
-- 控制器内部 IK，可能因奇异点/关节限位急停（红光）
-- 1 次 TCP 往返/周期，但被拒会崩溃
-
-### 旋转帧间差分模式 (默认)
-
-特点:
-- 手柄旋转每帧只产生微小增量，运动平滑
-- RG 松手 → 清零上一帧 → 再握住不跳变
-- 来源: lerobot_franka_teleop 的 OculusRobot
-
-### 旋转原点差分模式
-
-```bash
-python3 servoj_teleop.py --robot-ip 192.168.5.1 --rotation-mode origin-delta ...
-```
-
-特点:
-- 姿态由“当前手柄姿态 - 对齐时手柄姿态”直接映射
-- 适合验证“固定机械臂姿态是否导致逆解限位”
-- 建议先用较小 `--rotation-scale 0.05~0.20` 测试
-
----
-
-## 文件结构
-
-```
-dobot_teleop/
-├── README.md
-├── servoj_teleop.py              ← 主入口 (ServoJ 默认, 可切 ServoP)
-├── servoj_toolframe_teleop.py    ← 工具坐标系姿态版本
-├── servop_toolframe_teleop.py    ← 工具坐标系姿态 + ServoP 版本
-├── toolframe_governor_teleop.py  ← 工具坐标系姿态 + 在线 target governor
-├── servop_test_direct.py         ← 单步 ServoP 测试
-└── dobot_teleop/                 ← Python 包
-    ├── __init__.py
-    ├── dobot_dashboard.py        ← Dobot TCP 封装 (ServoJ, ServoP, GetPose)
-    ├── quest_udp.py              ← Quest UDP 接收 + 按钮解析
-    ├── toolframe_mapping.py      ← 工具坐标系姿态 mapper
-    └── teleop_mapping.py         ← 核心后处理: 坐标系变换/滤波/限幅
-```
-
----
-
 ## 链路自检
-
-如果遇到问题，按这个顺序排查:
 
 ```
 1. Quest App 是否在发送数据?
-   → 终端打印 "First Quest pose received"? 
+   → 终端打印 "First Quest pose received"?
    → 否则检查 WiFi / App IP 配置
 
 2. UDP 端口是否被占用?
@@ -476,7 +409,7 @@ dobot_teleop/
 
 3. 机械臂 TCP 是否可达?
    → nc -z 192.168.5.1 29999
-   → 或用 servop_test_direct.py 测试
+   → 或用 tests/servop_test_direct.py 测试
 
 4. ServoP 返回错误?
    → 查看终端输出 error_id
@@ -490,4 +423,4 @@ dobot_teleop/
 
 - lerobot_franka_teleop: OculusRobot._compute_delta_pose() — 帧间差分 + 坐标系变换
 - Dobot CR5 官方 SDK: `TCP-IP-Python-V4/dobot_api.py`
-- ROS2 对标节点: `quest3_cr5_servop_teleop.py` — 3-DOF 缺失旋转，建议用本方案替代
+- LeRobot 数据集格式: https://github.com/huggingface/lerobot
