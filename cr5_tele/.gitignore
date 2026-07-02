@@ -7,8 +7,16 @@ __pycache__/
 *.pyo
 
 # 虚拟环境
-openpi/.venv/
 .venv/
+openpi/.venv/
+openpi/openpi_cache/
+
+# 训练产物
+openpi/checkpoints/
+openpi/assets/
+
+# 压缩包
+openpi.zip
 
 # IDE / 工具
 .claude/

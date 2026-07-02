@@ -19,7 +19,17 @@
       "Bash(conda run *)",
       "Bash(pip install *)",
       "Bash(/home/jiaotan/openpi/.venv/bin/python3 -c \"from PIL import Image; print\\('OK'\\)\")",
-      "Bash(/home/jiaotan/openpi/.venv/bin/pip install *)"
+      "Bash(/home/jiaotan/openpi/.venv/bin/pip install *)",
+      "Bash(nohup /opt/ros/humble/bin/realsense-viewer)",
+      "Bash(echo \"已启动 realsense-viewer \\(PID $!\\)\")",
+      "Read(//home/jiaotan/.local/share/uv/python/cpython-3.11.15-linux-x86_64-gnu/bin/**)",
+      "Bash(/home/jiaotan/dobot_ws/src/AMAS/cr5_tele/openpi/.venv/bin/python3 --version)",
+      "Bash(/home/jiaotan/dobot_ws/src/AMAS/cr5_tele/openpi/.venv/bin/pip list *)",
+      "Bash(uv run *)",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)"
     ]
   }
 }
