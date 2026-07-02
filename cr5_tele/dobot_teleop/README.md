@@ -205,8 +205,11 @@ python3 scripts/dataset/record_cr5a_pi0_dataset.py \
   --teleop-action-host 127.0.0.1 --teleop-action-port 5010 \
   --teleop-state-source stream \
   --max-action-age-ms 200 \
-  --record-only-when-deadman --drop-no-action
+  --record-only-when-deadman --drop-no-action \
+  --save-png-frames
 ```
+
+> 加 `--save-png-frames` 会同时在 `episode_XXXXXX_png/d415/` 和 `d435/` 下保存每帧 PNG，方便肉眼检查相机视角。不需要肉眼检查时可以去掉这个参数节省磁盘空间。
 
 多次录制到同一个 `--output-dir` 会自动追加 episode。录制完即可直接用于训练，无需转换。
 

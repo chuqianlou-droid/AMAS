@@ -339,6 +339,25 @@ def enable_teleop(client, mapper, latest_pose, args):
     return True, robot_joints
 
 
+def reseed_on_deadman_press(client, mapper, latest_pose, fallback_pose, args):
+    """Reset mapper and joint limiter at the RG rising edge.
+
+    The first frame after pressing the deadman switch should establish a fresh
+    Quest and robot origin, not send a motion command based on stale startup
+    state.
+    """
+    if args.dry_run:
+        robot_pose = list(fallback_pose or mapper._last_target)
+        robot_joints = [0.0] * 6
+    else:
+        robot_pose = client.get_pose()
+        robot_joints = client.get_angle()
+
+    mapper.reset(latest_pose, robot_pose)
+    print(f"  ↳ clutch: aligned to current robot pose={format_pose(robot_pose)}")
+    return robot_pose, robot_joints
+
+
 def _base_frame_pose_delta(reference_pose, target_pose):
     """Return the target delta used by the Cartesian controller in mm/deg."""
     delta_pos = [float(target_pose[index] - reference_pose[index]) for index in range(3)]
@@ -388,6 +407,7 @@ def main():
     enabled = False
     latest_pose = None
     first_pose_printed = False
+    was_rg_pressed = False
     last_status_time = time.monotonic()
     last_target_log_time = 0.0
     last_quest_log_time = 0.0
@@ -455,6 +475,7 @@ def main():
                             last_command_pose = list(mapper._last_target)
                             last_command_joints = None
                             last_sent_joints = robot_joints
+                            was_rg_pressed = False
 
             # -- keyboard commands -------------------------------------------
             while True:
@@ -469,9 +490,11 @@ def main():
                         last_command_pose = list(mapper._last_target)
                         last_command_joints = None
                         last_sent_joints = robot_joints
+                        was_rg_pressed = False
                 elif key == "p":
                     enabled = False
                     last_command_pose = None
+                    was_rg_pressed = False
                     if args.dry_run:
                         print("Teleop paused. DRY RUN: Stop skipped.")
                     else:
@@ -497,6 +520,7 @@ def main():
                 elif key == "s":
                     enabled = False
                     last_command_pose = None
+                    was_rg_pressed = False
                     if args.dry_run:
                         print("DRY RUN: Stop skipped.")
                     else:
@@ -504,6 +528,7 @@ def main():
                 elif key == "q":
                     enabled = False
                     last_command_pose = None
+                    was_rg_pressed = False
                     stop_requested = True
                     break
                 elif key:
@@ -543,6 +568,20 @@ def main():
                 # Deadman switch: RG (Right Grip) button
                 rg_val = latest_pose.buttons.get("RG", 0.0)
                 rg_pressed = args.ignore_deadman or rg_val > 0.5
+
+                if rg_pressed and not was_rg_pressed:
+                    try:
+                        last_command_pose, last_sent_joints = reseed_on_deadman_press(
+                            client, mapper, latest_pose, last_command_pose, args
+                        )
+                    except DobotDashboardError as exc:
+                        print(f"Cannot align on RG press: {exc}")
+                        was_rg_pressed = rg_pressed
+                        continue
+                    last_command_joints = None
+                    was_rg_pressed = rg_pressed
+                    continue
+                was_rg_pressed = rg_pressed
 
                 target, info = mapper.target_from_quest(latest_pose, rg_pressed=rg_pressed)
                 gripper_cmd = QuestTeleopMapper.gripper_from_trigger(latest_pose)

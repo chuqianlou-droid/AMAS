@@ -8,6 +8,7 @@ import json
 import os
 import select
 import sys
+import termios
 import threading
 import time
 from dataclasses import dataclass
@@ -285,6 +286,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-width", type=int, default=224)
     parser.add_argument("--camera-height", type=int, default=224)
     parser.add_argument("--camera-fps", type=int, default=15)
+    parser.add_argument("--camera-timeout-ms", type=int, default=3000,
+                        help="Timeout for the first RealSense frame read attempt")
+    parser.add_argument("--camera-read-retries", type=int, default=5,
+                        help="Per-frame RealSense read attempts before dropping that frame")
+    parser.add_argument("--camera-retry-timeout-ms", type=int, default=1000,
+                        help="Timeout for repeated RealSense read attempts")
+    parser.add_argument("--max-camera-failures", type=int, default=20,
+                        help="Abort after this many RealSense frame read failures; use 0 to never abort")
+    parser.add_argument("--no-restart-cameras-on-failure", action="store_true",
+                        help="Do not restart RealSense pipelines after a failed frame read")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--episode-index", type=int)
     parser.add_argument("--format", choices=("raw", "lerobot"), default="raw",
@@ -343,6 +354,14 @@ def main() -> None:
         raise SystemExit("--record-rate must be positive")
     if args.max_action_age_ms < 0:
         raise SystemExit("--max-action-age-ms must not be negative")
+    if args.camera_timeout_ms <= 0:
+        raise SystemExit("--camera-timeout-ms must be positive")
+    if args.camera_read_retries <= 0:
+        raise SystemExit("--camera-read-retries must be positive")
+    if args.camera_retry_timeout_ms <= 0:
+        raise SystemExit("--camera-retry-timeout-ms must be positive")
+    if args.max_camera_failures < 0:
+        raise SystemExit("--max-camera-failures must not be negative")
 
     # ── Tool offset configuration ──────────────────────────────────────────
     tool_offset_cfg = ToolOffsetConfig(
@@ -382,7 +401,14 @@ def main() -> None:
         else None
     )
     camera = DualRealSenseRGBProvider(
-        args.d415_serial, args.d435_serial, args.camera_width, args.camera_height, args.camera_fps
+        args.d415_serial,
+        args.d435_serial,
+        args.camera_width,
+        args.camera_height,
+        args.camera_fps,
+        timeout_ms=args.camera_timeout_ms,
+        read_retries=args.camera_read_retries,
+        read_retry_timeout_ms=args.camera_retry_timeout_ms,
     )
     action_subscriber = (
         TeleopActionSubscriber(args.teleop_action_host, args.teleop_action_port)
@@ -408,6 +434,7 @@ def main() -> None:
     frames_dropped_no_action = 0
     frames_dropped_stale_action = 0
     frames_dropped_deadman = 0
+    frames_dropped_camera = 0
     frames_seen = 0
     last_pose_diff_log_time = 0.0
 
@@ -417,18 +444,46 @@ def main() -> None:
         print(f"Teleop state source: {args.teleop_state_source}")
     else:
         print(f"Action source: mock ({args.mock_action})")
-    print("Keys: s=stop and save, Ctrl+C=interrupt and save")
+    print("Keys: press s/S to stop and save, Ctrl+C=interrupt and save")
 
     # ── Non-blocking keyboard watcher ─────────────────────────────────────
-    stop_requested = False
+    stop_event = threading.Event()
+    stop_notice_printed = threading.Event()
+
+    def _request_stop_from_key() -> None:
+        stop_event.set()
+        if not stop_notice_printed.is_set():
+            stop_notice_printed.set()
+            print("\nStop requested. Finishing current frame and saving...", flush=True)
+
     def _keyboard_watcher():
-        nonlocal stop_requested
-        while not stop_requested:
-            if select.select([sys.stdin], [], [], 0.1)[0]:
-                line = sys.stdin.readline()
-                if line.strip().lower() == 's':
-                    stop_requested = True
-                    break
+        if not sys.stdin.isatty():
+            while not stop_event.is_set():
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    line = sys.stdin.readline()
+                    if line.strip().lower() in {"s", "q"}:
+                        _request_stop_from_key()
+                        break
+            return
+
+        fd = sys.stdin.fileno()
+        old_attrs = termios.tcgetattr(fd)
+        new_attrs = old_attrs[:]
+        # Non-canonical, no-echo input: a single s/S/q key stops immediately
+        # without needing Enter and without printing the key into frame logs.
+        new_attrs[3] &= ~(termios.ICANON | termios.ECHO)
+        new_attrs[6][termios.VMIN] = 0
+        new_attrs[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSADRAIN, new_attrs)
+        try:
+            while not stop_event.is_set():
+                if select.select([sys.stdin], [], [], 0.1)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch.lower() in {"s", "q"}:
+                        _request_stop_from_key()
+                        break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
     kb_thread = threading.Thread(target=_keyboard_watcher, daemon=True)
     kb_thread.start()
 
@@ -439,10 +494,12 @@ def main() -> None:
         deadline = time.monotonic() + args.duration_sec
         period = 1.0 / record_rate
         next_tick = time.monotonic()
-        while time.monotonic() < deadline and not stop_requested:
+        while time.monotonic() < deadline and not stop_event.is_set():
             delay = next_tick - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
+            if stop_event.is_set():
+                break
             next_tick += period
             frames_seen += 1
             sample_now_s = time.time()
@@ -473,7 +530,25 @@ def main() -> None:
                     continue
             else:
                 sample = None
-            d435, d415 = camera.get_rgb_images()
+            if stop_event.is_set():
+                break
+            try:
+                d435, d415 = camera.get_rgb_images()
+            except RuntimeError as exc:
+                frames_dropped_camera += 1
+                print(
+                    f"Camera frame dropped ({frames_dropped_camera}"
+                    f"{'' if args.max_camera_failures == 0 else f'/{args.max_camera_failures}'}): {exc}",
+                    flush=True,
+                )
+                if args.max_camera_failures and frames_dropped_camera >= args.max_camera_failures:
+                    raise
+                if not args.no_restart_cameras_on_failure:
+                    print("Restarting RealSense pipelines...", flush=True)
+                    camera.restart()
+                continue
+            if stop_event.is_set():
+                break
             if args.action_source == "teleop" and args.teleop_state_source == "stream":
                 if sample.controller_pose is None or sample.controller_joints is None:
                     frames_dropped_no_action += 1
@@ -532,12 +607,15 @@ def main() -> None:
                 )
     except KeyboardInterrupt:
         interrupted = True
-        stop_requested = True
+        stop_event.set()
         print("Recording interrupted (Ctrl+C); saving captured frames.")
     except (OSError, RuntimeError, ValueError, DobotDashboardError) as exc:
         failure = exc
         print(f"Recording stopped due to error: {exc}")
     finally:
+        stop_event.set()
+        if sys.stdin.isatty():
+            kb_thread.join(timeout=0.3)
         camera.close()
         if client is not None:
             client.close()
@@ -546,6 +624,7 @@ def main() -> None:
 
     if timestamps:
         if args.format == "lerobot":
+            print(f"Saving {len(timestamps)} frames to LeRobot dataset...", flush=True)
             # ── 直接写入 LeRobot 格式 ──────────────────────────────────────
             assert lerobot_writer is not None
             # observation.state = joints(6) + gripper(1) = 7
@@ -568,6 +647,7 @@ def main() -> None:
             print(f"Saved {len(timestamps)} frames → LeRobot episode {ep_idx} in {args.output_dir}")
             # ── 可选: 同时导出 PNG 方便肉眼检查 ──────────────────────────
             if args.save_png_frames:
+                print("Saving PNG preview frames...", flush=True)
                 from PIL import Image as PILImage
                 png_dir = Path(args.output_dir) / f"episode_{ep_idx:06d}_png"
                 d415_dir = png_dir / "d415"
@@ -628,7 +708,8 @@ def main() -> None:
     print(f"Frames dropped no action: {frames_dropped_no_action}")
     print(f"Frames dropped stale action: {frames_dropped_stale_action}")
     print(f"Frames dropped deadman: {frames_dropped_deadman}")
-    if stop_requested:
+    print(f"Frames dropped camera: {frames_dropped_camera}")
+    if stop_event.is_set() and not interrupted and failure is None:
         print("Recording stopped by user (s key).")
     if failure is not None:
         raise SystemExit(1)

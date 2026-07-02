@@ -1,0 +1,27 @@
+# 数据集（轨迹数据不上传）
+dobot_teleop/datasets/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+openpi/.venv/
+.venv/
+
+# IDE / 工具
+.claude/
+.vscode/
+.idea/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
+# 大文件（相机抓图）
+*.png
+*.jpg

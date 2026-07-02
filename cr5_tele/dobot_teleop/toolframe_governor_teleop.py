@@ -612,6 +612,26 @@ def enable_teleop(client, mapper, governor, latest_pose, args):
     return True, robot_joints
 
 
+def reseed_on_deadman_press(client, mapper, governor, latest_pose, args):
+    """Align all motion state to the robot at the RG rising edge.
+
+    This avoids the first command after a fresh grip from containing stale
+    Quest, governor, or joint-limiter state gathered before the operator was
+    actually holding the deadman switch.
+    """
+    if args.dry_run:
+        robot_pose = governor.current_target()
+        robot_joints = [0.0] * 6
+    else:
+        robot_pose = client.get_pose()
+        robot_joints = client.get_angle()
+
+    mapper.reset(latest_pose, robot_pose)
+    governor.reset(robot_pose)
+    print(f"  ↳ clutch: aligned to current robot pose={format_pose(robot_pose)}")
+    return robot_joints
+
+
 def main():
     args = parse_args()
     if not 20 <= args.gripper_force <= 100:
@@ -766,6 +786,7 @@ def main():
                             client, mapper, governor, latest_pose, args
                         )
                         joint_lag_active = False
+                        was_rg_pressed = False
 
             while True:
                 try:
@@ -778,9 +799,11 @@ def main():
                         client, mapper, governor, latest_pose, args
                     )
                     joint_lag_active = False
+                    was_rg_pressed = False
                 elif key == "p":
                     enabled = False
                     joint_lag_active = False
+                    was_rg_pressed = False
                     if args.dry_run:
                         print("Teleop paused. DRY RUN: Stop skipped.")
                     else:
@@ -800,12 +823,14 @@ def main():
                 elif key == "s":
                     enabled = False
                     joint_lag_active = False
+                    was_rg_pressed = False
                     if args.dry_run:
                         print("DRY RUN: Stop skipped.")
                     else:
                         print(client.stop())
                 elif key == "q":
                     enabled = False
+                    was_rg_pressed = False
                     stop_requested = True
                     break
                 elif key:
@@ -846,8 +871,17 @@ def main():
 
                 # ── 离合器: RG按下瞬间，消除governor追赶滞后 ──────
                 if rg_pressed and not was_rg_pressed:
-                    mapper.sync_accum_to_pose(governor.current_target())
-                    print(f"  ↳ clutch: mapper synced to governor cmd={format_pose(governor.current_target())}")
+                    try:
+                        last_sent_joints = reseed_on_deadman_press(
+                            client, mapper, governor, latest_pose, args
+                        )
+                    except DobotDashboardError as exc:
+                        print(f"Cannot align on RG press: {exc}")
+                        was_rg_pressed = rg_pressed
+                        continue
+                    joint_lag_active = False
+                    was_rg_pressed = rg_pressed
+                    continue
                 was_rg_pressed = rg_pressed
 
                 raw_target, info = mapper.target_from_quest(

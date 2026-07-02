@@ -26,6 +26,9 @@ class DualRealSenseRGBProvider:
     height: int = 224
     fps: int = 15
     timeout_ms: int = 3000
+    read_retries: int = 5
+    read_retry_timeout_ms: int = 1000
+    read_retry_delay_s: float = 0.1
 
     def __post_init__(self) -> None:
         self._rs = None
@@ -47,18 +50,30 @@ class DualRealSenseRGBProvider:
 
     def _start_camera(self, serial: str):
         assert self._rs is not None
-        pipeline = self._rs.pipeline()
-        config = self._rs.config()
-        config.enable_device(serial)
-        config.enable_stream(
-            self._rs.stream.color,
-            self.CAPTURE_WIDTH,
-            self.CAPTURE_HEIGHT,
-            self._rs.format.rgb8,
-            self.CAPTURE_FPS,
-        )
-        pipeline.start(config)
-        return pipeline
+        requested_fps = max(1, int(self.fps))
+        candidate_fps = list(dict.fromkeys([requested_fps, self.CAPTURE_FPS]))
+        errors: list[str] = []
+        for capture_fps in candidate_fps:
+            pipeline = self._rs.pipeline()
+            config = self._rs.config()
+            config.enable_device(serial)
+            config.enable_stream(
+                self._rs.stream.color,
+                self.CAPTURE_WIDTH,
+                self.CAPTURE_HEIGHT,
+                self._rs.format.rgb8,
+                capture_fps,
+            )
+            try:
+                pipeline.start(config)
+                return pipeline
+            except Exception as exc:
+                errors.append(f"{self.CAPTURE_WIDTH}x{self.CAPTURE_HEIGHT}@{capture_fps}: {exc}")
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+        raise RuntimeError(f"RealSense {serial}: failed to start RGB stream; tried {', '.join(errors)}")
 
     # Retry constants for transient USB frame drops
     _READ_RETRIES = 5
@@ -75,32 +90,35 @@ class DualRealSenseRGBProvider:
 
     def _read_color(self, pipeline, serial: str) -> np.ndarray:
         last_error: Exception | None = None
-        for attempt in range(self._READ_RETRIES):
+        read_retries = max(1, int(self.read_retries))
+        retry_timeout_ms = max(1, int(self.read_retry_timeout_ms))
+        retry_delay_s = max(0.0, float(self.read_retry_delay_s))
+        for attempt in range(read_retries):
             try:
                 # Use a shorter timeout per attempt so total wait is bounded
-                timeout = self.timeout_ms if attempt == 0 else self._READ_RETRY_TIMEOUT_MS
+                timeout = self.timeout_ms if attempt == 0 else retry_timeout_ms
                 frames = pipeline.wait_for_frames(timeout)
             except RuntimeError as exc:
                 last_error = exc
-                if attempt < self._READ_RETRIES - 1:
+                if attempt < read_retries - 1:
                     import time
-                    time.sleep(self._READ_RETRY_DELAY_S)
+                    time.sleep(retry_delay_s)
                 continue
 
             color_frame = frames.get_color_frame()
             if not color_frame:
                 last_error = RuntimeError(f"RealSense {serial} returned no RGB frame")
-                if attempt < self._READ_RETRIES - 1:
+                if attempt < read_retries - 1:
                     import time
-                    time.sleep(self._READ_RETRY_DELAY_S)
+                    time.sleep(retry_delay_s)
                 continue
 
             image = np.asanyarray(color_frame.get_data())
             if image.shape != (self.CAPTURE_HEIGHT, self.CAPTURE_WIDTH, 3):
                 last_error = RuntimeError(f"RealSense {serial} returned unexpected RGB shape {image.shape}")
-                if attempt < self._READ_RETRIES - 1:
+                if attempt < read_retries - 1:
                     import time
-                    time.sleep(self._READ_RETRY_DELAY_S)
+                    time.sleep(retry_delay_s)
                 continue
 
             image = image.astype(np.uint8, copy=False)
@@ -110,8 +128,13 @@ class DualRealSenseRGBProvider:
 
         # All retries exhausted
         raise RuntimeError(
-            f"RealSense {serial}: failed to read frame after {self._READ_RETRIES} attempts"
+            f"RealSense {serial}: failed to read frame after {read_retries} attempts"
         ) from last_error
+
+    def restart(self) -> None:
+        """Restart both camera pipelines after a transient USB/camera stall."""
+        self.close()
+        self.start()
 
     @staticmethod
     def _resize_rgb_nearest(image: np.ndarray, width: int, height: int) -> np.ndarray:
