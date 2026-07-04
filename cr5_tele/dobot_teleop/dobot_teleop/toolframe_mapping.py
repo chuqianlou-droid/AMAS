@@ -141,7 +141,16 @@ class ToolFrameQuestTeleopMapper:
         self._accum_delta_pos = np.zeros(3)
         self._accum_delta_rot = np.zeros(3)
         self._origin_delta_base_rot = np.zeros(3)
-        self._last_target = list(robot_pose)
+        origin_R = self._euler_deg_to_R(robot_pose[3:])
+        canonical_euler = R.from_matrix(origin_R).as_euler("XYZ", degrees=True)
+        self._last_target = [
+            robot_pose[0],
+            robot_pose[1],
+            robot_pose[2],
+            float(canonical_euler[0]),
+            float(canonical_euler[1]),
+            float(canonical_euler[2]),
+        ]
         self._last_rg_pressed = False
 
     def target_from_quest(

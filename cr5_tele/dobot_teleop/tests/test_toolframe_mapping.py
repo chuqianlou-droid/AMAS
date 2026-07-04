@@ -47,6 +47,7 @@ class ToolFrameMappingTest(unittest.TestCase):
         )
         mapper = QuestTeleopMapper(cfg)
         mapper.reset(pose(), [0.0, 0.0, 300.0, 0.0, 0.0, 0.0])
+        mapper.target_from_quest(pose(), rg_pressed=True)
 
         target, info = mapper.target_from_quest(
             pose(rot=R.from_euler("Z", 10.0, degrees=True)),
@@ -71,6 +72,7 @@ class ToolFrameMappingTest(unittest.TestCase):
         mapper = QuestTeleopMapper(cfg)
         robot_origin = [0.0, 0.0, 300.0, 20.0, 30.0, 40.0]
         mapper.reset(pose(), robot_origin)
+        mapper.target_from_quest(pose(), rg_pressed=True)
 
         target, _ = mapper.target_from_quest(
             pose(rot=R.from_euler("X", 15.0, degrees=True)),
@@ -101,9 +103,28 @@ class ToolFrameMappingTest(unittest.TestCase):
             rg_pressed=False,
         )
 
-        self.assertEqual(target, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        self.assertTrue(np.allclose(target, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
         self.assertAlmostEqual(info["sent_step_mm"], 0.0)
         self.assertAlmostEqual(info["sent_step_deg"], 0.0)
+
+    def test_first_rg_press_does_not_send_spurious_euler_jump(self):
+        cfg = QuestTeleopConfig(
+            position_scale=0.0,
+            rotation_scale=0.0,
+            target_deadband_mm=0.0,
+            target_deadband_deg=0.0,
+            max_step_deg=360.0,
+        )
+        mapper = QuestTeleopMapper(cfg)
+        # Non-canonical XYZ Euler representation of the same rotation as
+        # [7.8, 3.7, -33.1].  Dobot may report either representation.
+        robot_origin = [0.0, 0.0, 300.0, 187.8, 176.3, 146.9]
+        mapper.reset(pose(), robot_origin)
+
+        _target, info = mapper.target_from_quest(pose(), rg_pressed=True)
+
+        self.assertAlmostEqual(info["sent_step_mm"], 0.0)
+        self.assertAlmostEqual(info["sent_step_deg"], 0.0, places=6)
 
     def test_total_translation_limit_caps_accumulator(self):
         cfg = QuestTeleopConfig(
@@ -123,6 +144,7 @@ class ToolFrameMappingTest(unittest.TestCase):
         )
         mapper = QuestTeleopMapper(cfg)
         mapper.reset(pose(), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        mapper.target_from_quest(pose(), rg_pressed=True)
 
         mapper.target_from_quest(pose(x=1.0), rg_pressed=True)
 
@@ -142,6 +164,7 @@ class ToolFrameMappingTest(unittest.TestCase):
         )
         mapper = QuestTeleopMapper(cfg)
         mapper.reset(pose(), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        mapper.target_from_quest(pose(), rg_pressed=True)
 
         target, _ = mapper.target_from_quest(pose(x=1.0), rg_pressed=True)
         self.assertAlmostEqual(target[0], 10.0)

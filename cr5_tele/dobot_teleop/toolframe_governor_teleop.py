@@ -612,6 +612,25 @@ def enable_teleop(client, mapper, governor, latest_pose, args):
     return True, robot_joints
 
 
+def recover_collision_alarm(client, mode) -> bool:
+    """Clear Dobot collision alarm and re-enable the robot.
+
+    Returns True when a collision alarm was handled.  The caller should pause
+    teleop state afterwards so the next motion starts from a fresh alignment.
+    """
+    if mode != 11:
+        return False
+    print("  ↳ robot_mode=11 (COLLISION), clearing alarm...")
+    try:
+        print(client.clear_error())
+        print(client.enable_robot())
+        print("  ↳ ClearError + EnableRobot OK. Teleop paused; re-align before moving.")
+        return True
+    except DobotDashboardError as exc:
+        print(f"  ↳ alarm recovery failed: {exc}")
+        return False
+
+
 def reseed_on_deadman_press(client, mapper, governor, latest_pose, args):
     """Align all motion state to the robot at the RG rising edge.
 
@@ -990,14 +1009,11 @@ def main():
                                 f"planned=[{format_joints(planned_joints)}], "
                                 f"robot_mode={mode}, response={exc}, skipping"
                             )
-                            # Auto-clear collision mode so teleop can continue
-                            if mode == 11:
-                                try:
-                                    print("  ↳ robot_mode=11 (COLLISION), auto-clearing...")
-                                    client.clear_error()
-                                    print("  ↳ ClearError OK, robot should resume.")
-                                except DobotDashboardError as ce:
-                                    print(f"  ↳ ClearError also failed: {ce}")
+                            if recover_collision_alarm(client, mode):
+                                enabled = False
+                                joint_lag_active = False
+                                was_rg_pressed = False
+                                last_sent_joints = None
                             continue
                     else:
                         try:
@@ -1031,6 +1047,11 @@ def main():
                                 f"cmd_lag_rot={cmd_lag_rot:.1f}deg, "
                                 f"robot_mode={mode}, joints=[{angle_text}], skipping"
                             )
+                            if recover_collision_alarm(client, mode):
+                                enabled = False
+                                joint_lag_active = False
+                                was_rg_pressed = False
+                                last_sent_joints = None
                             continue
 
                 gripper_cmd = QuestTeleopMapper.gripper_from_trigger(latest_pose)

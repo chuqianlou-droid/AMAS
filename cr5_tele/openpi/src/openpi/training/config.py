@@ -1036,7 +1036,9 @@ _CONFIGS = [
     TrainConfig(
         name="pi0_cr5a",
         model=pi0_config.Pi0Config(),
-        data=LeRobotCR5ADataConfig(),
+        data=LeRobotCR5ADataConfig(
+            assets=AssetsConfig(asset_id="lerobot_dataset"),
+        ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_base/params"
         ),
@@ -1045,7 +1047,9 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_cr5a",
         model=pi0_config.Pi0Config(pi05=True),
-        data=LeRobotCR5ADataConfig(),
+        data=LeRobotCR5ADataConfig(
+            assets=AssetsConfig(asset_id="lerobot_dataset"),
+        ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_base/params"
         ),
@@ -1057,7 +1061,9 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ),
-        data=LeRobotCR5ADataConfig(),
+        data=LeRobotCR5ADataConfig(
+            assets=AssetsConfig(asset_id="lerobot_dataset"),
+        ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_base/params"
         ),
@@ -1075,7 +1081,9 @@ _CONFIGS = [
             action_horizon=50,
             max_token_len=180,
         ),
-        data=LeRobotCR5ADataConfig(),
+        data=LeRobotCR5ADataConfig(
+            assets=AssetsConfig(asset_id="lerobot_dataset"),
+        ),
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi0_fast_base/params"
         ),

@@ -3,7 +3,9 @@ import unittest
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from pi0_cr5a_bridge import Pi0ActionAdapter, extract_action_chunk
+from pathlib import Path
+
+from pi0_cr5a_bridge import Pi0ActionAdapter, _find_openpi_client_source, extract_action_chunk
 from toolframe_governor_teleop import CartesianSafetyEnvelope
 
 
@@ -52,6 +54,17 @@ class Pi0Cr5aBridgeTest(unittest.TestCase):
         chunk = extract_action_chunk({"actions": [1, 2, 3, 4, 5, 6, 0]}, "actions", 3)
         self.assertEqual(len(chunk), 1)
         self.assertTrue(np.array_equal(chunk.popleft(), np.array([1, 2, 3, 4, 5, 6, 0])))
+
+    def test_finds_openpi_client_from_bridge_script_location(self):
+        bridge_path = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "bridge"
+            / "pi0_cr5a_bridge.py"
+        )
+        client_source = _find_openpi_client_source(bridge_path)
+
+        self.assertTrue((client_source / "openpi_client").is_dir())
 
 
 if __name__ == "__main__":

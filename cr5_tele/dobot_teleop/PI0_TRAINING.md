@@ -1,308 +1,18 @@
-# BUG 记录与排查文档
+# pi0 / OpenPI CR5A 训练与推理指南
 
-## 约定
+> 本文档涵盖 CR5A 的 pi0 微调全流程：代码修改、训练踩坑、参数说明、原理讲解。
+> 机械臂控制 BUG 文档见 [`BUGS_ROBOT.md`](./BUGS_ROBOT.md)。
 
-- 每条 BUG 记录必须包含：**现象、触发条件、根因（带代码引用）、修复方案、验证方法**
-- 按时间倒序排列（最新的在最上面）
-- 排查新 BUG 时先查本文档是否有类似问题
+## 目录
 
----
-
-## BUG-001: 首次 RG 按下时机械臂剧烈抖动（Euler 角表示不唯一）
-
-**日期**：2026-06-27
-
-### 现象
-
-- 遥操作启动（`auto_enable`）后，**第一次**按下 RG 手柄侧键时，机械臂会突然剧烈抖一下
-- 运动中松开 RG 再重新按下（离合器）**不会**抖动
-- 与奇异点无关（J5 不在 0° 或 90° 附近也会触发）
-- 切换为 ServoP 模式不会出现
-
-### 触发条件
-
-1. 启动遥操作脚本 → `auto_enable` 对齐
-2. 按下 RG 侧键（第一次）
-3. 机械臂抖动
-
-### 代码链路
-
-#### 步骤 1：对齐时 `_last_target` 的初始化
-
-`toolframe_governor_teleop.py` 中 `enable_teleop()` 调用 `mapper.reset()`：
-
-```python
-# toolframe_governor_teleop.py → enable_teleop()
-mapper.reset(latest_pose, robot_pose)   # robot_pose 来自 GetPose()
-```
-
-`toolframe_mapping.py` 中 `ToolFrameQuestTeleopMapper.reset()`：
-
-```python
-# toolframe_mapping.py → reset()
-self.robot_origin = list(robot_pose)          # 原始 GetPose 返回值
-self._last_target = list(robot_pose)          # ← 关键：存储了原始 Euler 角
-self._accum_delta_pos = np.zeros(3)
-self._accum_delta_rot = np.zeros(3)
-```
-
-此时 `_last_target` 存储的是 Dobot 控制器 `GetPose()` 直接返回的值，例如：
-```
-[-436.9, -538.8, 508.8,  -172.2,  -3.7,  146.9]
-                          ↑ Rx    ↑ Ry   ↑ Rz   (Euler XYZ, 度)
-```
-
-#### 步骤 2：首次 RG 按下 → 计算目标位姿
-
-`toolframe_mapping.py` 中 `target_from_quest()` 构建 `raw_target` 的旋转部分：
-
-```python
-# toolframe_mapping.py → target_from_quest()
-origin_R = self._euler_deg_to_R(self.robot_origin[3:])   # GetPose 原始 Euler → 矩阵
-delta_R_mat = R.from_rotvec(self._accum_delta_rot).as_matrix()  # 累积旋转 (首次=0 → I)
-target_R = origin_R @ delta_R_mat                        # = origin_R (首次)
-target_euler = R.from_matrix(target_R).as_euler("XYZ", degrees=True)  # ← 矩阵 → Euler
-```
-
-**关键**：`R.from_matrix(target_R).as_euler()` 返回的 Euler 角是 scipy 的 **canonical 表示**，可能与 `GetPose()` 返回的原始值**不同**，但它们代表**同一个旋转矩阵**。
-
-例如：
-```
-GetPose 返回:    Rx=-172.2°  Ry=-3.7°   Rz=146.9°
-as_euler 返回:   Rx=  7.8°   Ry= 3.7°   Rz=-33.1°    ← 等价的另一个 Euler 表示！
-```
-
-两个三元组对应同一个旋转矩阵 `R`，但数值完全不同。
-
-#### 步骤 3：计算 sent_step → 触发虚假的大角度差
-
-`toolframe_mapping.py` 中 `_info_for_target()` 计算本帧的旋转步长：
-
-```python
-# toolframe_mapping.py → _info_for_target()
-rot_diffs = [
-    angle_diff_deg(target[i], self._last_target[i]) for i in range(3, 6)
-]
-# target = [..., 7.8, 3.7, -33.1]       ← canonical 表示
-# _last_target = [..., -172.2, -3.7, 146.9]  ← GetPose 原始值
-# rot_diffs[0] = angle_diff_deg(7.8, -172.2) ≈ 180.0°   ← 虚假大差值！
-```
-
-`angle_diff_deg(7.8, -172.2)` = `(7.8 - (-172.2) + 180) % 360 - 180` = `360 % 360 - 180` = **-180°**
-
-#### 步骤 4：触发发送命令
-
-`toolframe_governor_teleop.py` 中 `should_send_target()`：
-
-```python
-# toolframe_governor_teleop.py
-sent_rot = info.get("sent_step_deg", 0.0)   # ≈ 180°
-# 远超 deadband (1.0°) 和 max_step (0.5°)
-raw_changed = rg_pressed and should_send_target(info)  # → True
-send_target = True
-```
-
-代码认为机械臂需要"修正"一个 180° 的旋转误差，但实际上没有任何旋转误差——只是同一个朝向用了两种等价的 Euler 角表示。
-
-#### 步骤 5：ServoJ 发送大角度命令 → 抖动
-
-```python
-# toolframe_governor_teleop.py
-desired_joints = client.inverse_kin(cmd_target)
-# IK 求解包含了虚假的大角度旋转 → 关节角大幅偏离当前值
-planned_joints, joint_step, _ = plan_joint_step(desired_joints, last_sent_joints, max_joint_step_deg)
-# plan_joint_step 限制了每步最大 0.7°，但第一个非零步仍然会突然开始旋转
-client.servoj(planned_joints, ...)
-```
-
-即使 `plan_joint_step` 把每步限制在 0.7°，但从静止突然开始转 0.7°，仍然会被感知为"抖一下"。而且如果 `max_joint_step_deg` 被之前的命令消耗掉（比如之前有微小位置移动），第一帧可能会有更大的旋转步。
-
-#### 为什么后续离合器不会触发？
-
-第一次 RG 按下后，`_last_target` 被更新为 `target_from_quest` 返回的目标位姿（使用 canonical Euler）：
-
-```python
-# toolframe_mapping.py → target_from_quest()
-self._last_target = target   # 已经是 canonical 表示
-```
-
-后续 RG 松开再按下时，`sync_accum_to_pose()` 把 `_accum_delta` 同步到当前位置后，`target_from_quest` 构建的 `target_euler` 与 `_last_target` 使用同一套 Euler 表示，`angle_diff_deg` 返回 ≈ 0，不会触发虚假修正。
-
-### 根因
-
-**Euler 角表示不唯一**：`scipy.spatial.transform.Rotation` 的 `as_euler()` 和 Dobot 控制器的 `GetPose()` 可能返回同一个旋转矩阵的不同 Euler 角三元组。代码在不同路径中混用了两种表示，导致 `angle_diff_deg` 算出虚假的大角度差。
-
-涉及的关键变量：
-
-| 变量 | 来源 | Euler 表示 | 设置位置 |
-|---|---|---|---|
-| `_last_target` | `mapper.reset()` → `GetPose()` | 控制器原始值 | `toolframe_mapping.py:144` |
-| `target_euler` | `target_from_quest()` → `R.from_matrix().as_euler()` | scipy canonical | `toolframe_mapping.py:204-207` |
-| `raw_target` | 同上 | scipy canonical | 同上 |
-
-### 修复
-
-`toolframe_mapping.py` 的 `sync_accum_to_pose()` 中，同步完 `_accum_delta_pos` 和 `_accum_delta_rot` 后，额外将 `_last_target` 也更新为 canonical Euler 表示：
-
-```python
-# toolframe_mapping.py → sync_accum_to_pose() 新增代码
-canonical_euler = R.from_matrix(
-    origin_R @ R.from_rotvec(self._accum_delta_rot).as_matrix()
-).as_euler("XYZ", degrees=True)
-self._last_target = [
-    target_pose[0], target_pose[1], target_pose[2],
-    float(canonical_euler[0]),
-    float(canonical_euler[1]),
-    float(canonical_euler[2]),
-]
-```
-
-`sync_accum_to_pose()` 在每次 RG 按下（包括首次）时被调用（`toolframe_governor_teleop.py` 中离合器逻辑），因此 `_last_target` 在第一次 RG 按下前就被统一到 canonical 表示，消除了 `angle_diff_deg` 的虚假差值。
-
-### 验证方法
-
-- 启动遥操作，按下 `e` 对齐
-- 按下 RG 侧键 → 机械臂不应抖动，应平滑跟随手柄运动
-- 运动中松开 RG，移动手柄到新位置，再按下 RG → 也不应抖动
-
-### 教训
-
-- **任何比较 Euler 角的场景，必须确保两个值来自同一种表示**（全部用 `R.from_matrix().as_euler()` 或全部用原始值）
-- `GetPose()` 返回的原始角度和 `as_euler()` 返回的角度**不能直接比较**
-- 如果必须比较两个方向，用旋转矩阵或四元数计算角度差（`R1 * R2.inv()` 的 `magnitude()`），不要比较 Euler 角分量
+- [MOD-001: openpi 新增 CR5A 训练支持](#mod-001-openpi-新增-cr5a-训练支持)
+- [BUG-010: 训练链路排障](#bug-010-autodl-服务器上-pi0_cr5a_lora-训练链路排障)
+- [CLI 参数踩坑记录](#openpi-scriptstrainpy-cli-参数踩坑记录)
+- [下一次训练完整清单](#下一次训练完整操作清单)
+- [为什么需要这些步骤（原理）](#为什么需要这些步骤原理说明)
+- [训练参数详解](#训练参数详解)
 
 ---
-
-## BUG-002: ServoJ 模式下 IK unsolvable（`joint_near` 参数格式错误）
-
-**日期**：2026-06-27
-
-### 现象
-
-遥操作启动后，所有 `inverse_kin()` 调用返回失败，日志持续输出 `IK unsolvable`。
-
-### 触发条件
-
-`dobot_dashboard.py` 中 `inverse_kin()` 传入 `joint_near` 参数后触发。
-
-### 根因
-
-SDK `InverseKin` 方法发送命令时，参数名使用大写 `JointNear=`，但 Dobot 控制器协议要求小写 `jointNear=`。详见 SDK 源码：
-
-```python
-# TCP-IP-Python-V4/dobot_api.py:882
-params.append('JointNear={:s}'.format(JointNear))  # 大写 J → 控制器不识别
-```
-
-不传 `joint_near` 时（默认行为），控制器根据**当前关节角**就近选解，已经满足需求。
-
-### 修复
-
-`toolframe_governor_teleop.py` 和 `servoj_toolframe_teleop.py` 中恢复为无参数调用：
-
-```python
-desired_joints = client.inverse_kin(cmd_target)
-# 不传 joint_near: 控制器默认根据当前关节角就近选解
-```
-
----
-
-## BUG-003: 机械臂"不受控制一直伸直"（离合器 position 滞后）
-
-**日期**：2026-06-27
-
-### 现象
-
-- 用户手柄往回拉，机械臂却继续往外伸
-- 日志中 `cmd_lag_pos` 达到 300mm+
-
-### 触发条件
-
-1. 按 RG 移动机械臂到远处
-2. 松开 RG
-3. 手柄移回近处
-4. 再次按 RG
-
-### 根因
-
-RG 松开再按下时，mapper 的 `_accum_delta_pos`（累积位移）不会被清零。上一段运动中累积的大位移（如 300mm）继续作为 `raw_target`。Governor 拼命从当前位置追赶这个远方目标，而不是从当前位置重新开始。
-
-### 修复
-
-在 `toolframe_governor_teleop.py` 中，检测到 RG 从 False→True 时，调用 `mapper.sync_accum_to_pose(governor.current_target())` 把 mapper 累积位移同步到 governor 当前位置，消除追赶滞后。
-
----
-
-## BUG-004: 离合器旋转滞后（`sync_accum_to_pose` 未同步旋转）
-
-**日期**：2026-06-27
-
-### 现象
-
-- 第一次 RG 按下后机械臂旋转方向不对（或抖动）
-- 位置跟随正常，旋转不正常
-
-### 触发条件
-
-BUG-003 修复后，`sync_accum_to_pose` 只同步了位置，未同步旋转。
-
-### 根因
-
-`sync_accum_to_pose` 最初只更新 `_accum_delta_pos`，未更新 `_accum_delta_rot`。RG 重新按下时，旋转累积还是上一个周期的旧值。
-
-### 修复
-
-在 `sync_accum_to_pose` 中增加旋转同步：
-
-```python
-origin_R = self._euler_deg_to_R(self.robot_origin[3:])
-target_R = self._euler_deg_to_R(target_pose[3:])
-delta_R = origin_R.T @ target_R
-self._accum_delta_rot = R.from_matrix(delta_R).as_rotvec()
-self._origin_delta_base_rot = self._accum_delta_rot.copy()
-```
-
----
-
-## BUG-005: ServoJ 触发碰撞检测 → robot_mode=11
-
-**日期**：2026-06-27
-
-### 现象
-
-- 机械臂运动一段时间后突然停下
-- 日志显示 `ServoJ rejected, robot_mode=11`
-- Dobot V4 文档：mode 11 = `ROBOT_MODE_COLLISION`（碰撞状态）
-
-### 触发条件
-
-ServoJ 模式下，`servo_gain` 过高 + `servo_t` 过短，导致控制器施加大力矩 → 被碰撞检测误判为碰撞。
-
-### 修复
-
-1. 降低 `servo_gain` 800→700，增大 `servo_t` 0.02→0.03，匹配 `command_rate` 33Hz
-2. 添加 `SetCollisionLevel(1)` 降低碰撞检测灵敏度
-3. 添加自动清除：当 `robot_mode==11` 时自动调用 `ClearError()`
-
----
-
-## 碰撞检测 / IK / 伺服相关错误码速查
-
-| robot_mode | 含义 | 处理 |
-|---|---|---|
-| 5 | ENABLE（空闲） | 正常 |
-| 7 | RUNNING（运动中） | 正常 |
-| 11 | COLLISION（碰撞） | 自动 ClearError，降低 gain/servo_t |
-
-| error_id | 含义 | 处理 |
-|---|---|---|
-| 0 | 成功 | — |
-| -1 | 命令失败 | 检查 robot_mode，若 mode=11 则 ClearError |
-| 其他负数 | 见 Dobot 文档 | 查 `alarm_controller.json` |
-
----
-
-# 代码修改记录（非 BUG，架构扩展）
 
 ## MOD-001: openpi 新增 CR5A 训练支持
 
@@ -1107,3 +817,177 @@ LeRobot v2.1 格式不只是"parquet 文件"，它还提供了：
 4. **`delta_timestamps`**：LeRobot 库自带"从当前帧往后取 N 帧 action"的功能 → 自动构建 action chunk
 
 如果直接读裸 parquet，上面所有功能都要自己实现。LeRobot 格式就是 openpi 的"标准接口"。
+
+---
+
+## 训练参数详解
+
+以下按 `scripts/train.py` 中出现的顺序解释每个参数的含义、默认值和调优建议。
+
+### CLI 参数
+
+#### `--batch-size`（默认 32）
+
+**每步训练用多少帧数据**。GPU 同时处理 batch_size 帧，计算一次梯度更新。
+
+- 设大了 → 显存不够 OOM
+- 设小了 → 梯度噪声大、收敛慢
+- 24GB 显存 LoRA 微调建议 **4**
+- 完整微调建议 **2**（如果 OOM 降到 1）
+
+> `batch_size` 是**全局** batch size。单卡训练时 `local_batch_size = batch_size`。多卡时会被均分。
+
+#### `--num-train-steps`（默认 30000）
+
+**训练总步数**。每一步 = 处理一个 batch。总帧数 = batch_size × num_train_steps。
+
+- 你的数据集 18367 帧 / batch_size=4 ≈ 4591 步 = **1 个 epoch**
+- 10000 步 ≈ 2.2 个 epoch，对微调来说足够
+- 如果想多练几轮，设 20000~30000
+
+#### `--checkpoint-base-dir`（默认 `./checkpoints`）
+
+**checkpoint 保存的根目录**。实际保存路径为：
+
+```text
+{checkpoint-base-dir}/{config-name}/{exp-name}/
+例: ./checkpoints/cr5a/pi0_cr5a_lora/cr5a_lora_v1/
+```
+
+#### `--exp-name`（必填）
+
+**实验名称**，用于区分不同训练配置的结果。建议用有意义的名字：
+
+```bash
+--exp-name=cr5a_v2_bs8_20k   # 版本2, batch_size=8, 20000步
+```
+
+#### `--seed`（默认 42）
+
+**随机种子**。固定后训练结果可复现。改数据、改参数后最好换个 seed。
+
+#### `--no-wandb-enabled`
+
+**关闭 Weights & Biases 日志**。服务器不能联网时关掉。本地有 W&B 账号的话开着可以看实时 loss 曲线。
+
+#### `--overwrite` / `--resume`
+
+- `--overwrite`：删除已有 checkpoint 重新开始
+- `--resume`：从上次 checkpoint 继续训练（步数从上次结束位置开始）
+- 两者互斥，不能同时用
+
+### 学习率参数（`--lr-schedule.*`）
+
+#### `--lr-schedule.peak-lr`（默认 2.5e-5）
+
+**学习率峰值**。控制每次梯度更新的步长：
+
+- 太大 → Loss 震荡甚至发散
+- 太小 → 收敛极慢
+- pi0 微调建议 **2e-5 ~ 5e-5**，默认 2.5e-5 适用大多数情况
+
+#### `--lr-schedule.warmup-steps`（默认 1000）
+
+**预热步数**。训练前 N 步学习率从 0 线性增长到 peak-lr。
+
+为什么需要预热？模型刚开始训练时梯度方向很不稳定，直接上大学习率容易把预训练权重"炸飞"。预热期让模型慢慢适应新数据。
+
+#### `--lr-schedule.decay-steps`（默认 30000）
+
+**衰减步数**。学习率从 peak-lr 余弦衰减到 decay-lr 的总步数。
+
+训练后期需要小学习率做精细调整，所以随着训练进行逐步降低学习率。
+
+#### `--lr-schedule.decay-lr`（默认 2.5e-6）
+
+**最终学习率**。衰减结束时的学习率，是 peak-lr 的 **1/10**。
+
+### 学习率变化曲线
+
+```
+lr
+^
+|     /\
+|    /  \
+|   /    \_________
+|  /              \
+| /                \
+|/                  \
++--|----|-----------|----> step
+   0   warmup     decay
+```
+
+- 0 ~ warmup_steps：线性增长 0 → peak_lr
+- warmup_steps ~ decay_steps：余弦衰减 peak_lr → decay_lr
+- decay_steps 之后：保持 decay_lr
+
+### 优化器参数（`--optimizer.*`）
+
+#### `--optimizer.weight-decay`（默认 1e-10）
+
+**权重衰减（L2 正则化）**。防止模型过拟合。pi0 默认值极小（几乎为零），因为微调数据量少，过强的正则化反而不好。
+
+#### `--optimizer.clip-gradient-norm`（默认 1.0）
+
+**梯度裁剪**。每个训练步，如果梯度的 L2 范数超过这个值，就按比例缩回去。
+
+防止某一步梯度突然爆炸（常见于数据中有极端样本）→ 参数突变 → 之前学到的全忘光。
+
+### 数据和模型参数
+
+#### `--data.repo-id`（必填）
+
+**数据集标识**。可以是 HuggingFace 仓库名（如 `physical-intelligence/libero`）或本地目录名（如 `lerobot_dataset`）。配合 `--data.root` 使用。
+
+#### `--data.root`
+
+**数据集本地根目录**。不为 None 时优先从本地加载，跳过 HuggingFace Hub。
+
+#### `--data.prompt-from-task`
+
+**是否从 LeRobot task 字段生成 prompt**。你的数据集没有独立 `prompt` 列，必须设为 `true`。
+
+#### `--model.action-dim`（默认 32）
+
+**模型 action 维度**。注意这是模型的**内部**维度，不是你数据集的 7D。
+
+pi0 内部用 32 维来表示任意机器人的 action。训练时 `PadStatesAndActions` 自动把你的 7D action 填充到 32D，推理时 `CR5AOutputs` 再取回 7D。**不需要改这个参数**。
+
+#### `--model.action-horizon`（默认 50）
+
+**动作预测长度（action chunk）**。模型一次输出未来 50 步的动作指令。
+
+- 50 步 × 15fps ≈ 3.3 秒的动作序列
+- 值越大，模型"看得越远"，但计算量也越大
+- CR5A 用默认 50 即可
+
+### 保存和日志参数
+
+#### `--log-interval`（默认 100）
+
+**每隔多少步打印一次 loss**。训练日志中每隔 100 步看到的 `Step 100: loss=0.2632` 就是这样来的。
+
+#### `--save-interval`（默认 1000）
+
+**每隔多少步保存一次 checkpoint**。checkpoint 保存到 `{checkpoint-base-dir}/{config-name}/{exp-name}/`。
+
+#### `--keep-period`（默认 5000）
+
+**保留策略**：只保留 step % 5000 == 0 的 checkpoint。旧的会被自动清理，节省磁盘空间。
+
+### 完整训练命令参数对照
+
+```bash
+uv run python scripts/train.py \
+  pi0_cr5a_lora \                          # config 名称（位置参数，不是 --config-name）
+  --data.repo-id=lerobot_dataset \         # 数据集 ID
+  --data.root=/root/autodl-tmp/openpi/lerobot_dataset \  # 本地路径
+  --data.prompt-from-task=true \           # 从 task 字段生成 prompt（你的数据必须开）
+  --batch-size=4 \                         # 单步帧数（24GB 卡 LoRA 建议 4）
+  --num-train-steps=10000 \                # 总训练步数（2.2 epoch）
+  --checkpoint-base-dir=./checkpoints/cr5a \  # checkpoint 根目录
+  --exp-name=cr5a_lora_v1 \                # 实验名称（必填）
+  --seed=42 \                              # 随机种子
+  --no-wandb-enabled \                     # 关 W&B
+  --overwrite                              # 覆盖旧 checkpoint（或 --resume）
+```

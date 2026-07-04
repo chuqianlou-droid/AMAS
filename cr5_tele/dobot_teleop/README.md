@@ -181,7 +181,7 @@ python3 toolframe_governor_teleop.py \
   --enable-robot --clear-error --auto-enable \
   --log-targets --log-joints --log-timing --log-quest \
   --servo-mode joint \
-  --command-rate 50 --servo-t 0.03 --servo-gain 700 --servo-aheadtime 65 \
+  --command-rate 33 --servo-t 0.03 --servo-gain 700 --servo-aheadtime 55 \
   --rotation-mode frame-delta \
   --position-scale 0.80 --rotation-scale 0.30 \
   --filter-ratio-pos 0.50 --filter-ratio-rot 0.40 \
@@ -200,7 +200,7 @@ python3 scripts/dataset/record_cr5a_pi0_dataset.py \
   --output-dir ./datasets/cr5a_lerobot \
   --format lerobot \
   --prompt "pick the object" \
-  --duration-sec 30 \
+  --duration-sec 40 \
   --action-source teleop \
   --teleop-action-host 127.0.0.1 --teleop-action-port 5010 \
   --teleop-state-source stream \

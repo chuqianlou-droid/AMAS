@@ -33,3 +33,42 @@ Thumbs.db
 # 大文件（相机抓图）
 *.png
 *.jpg
+
+# Recorded trajectory / dataset outputs
+dobot_teleop/datasets/
+dobot_teleop/logs/
+datasets/
+**/datasets/
+**/recordings/
+**/trajectory/
+**/trajectories/
+**/traj/
+**/episode_*/
+lerobot_dataset/
+lerobot_dataset_reindexed/
+
+# Robot / camera / trajectory data files
+*.bag
+*.bag.active
+*.db3
+*.mcap
+*.h5
+*.hdf5
+*.parquet
+*.bson
+*.npz
+*.npy
+*.tfrecord
+*.tfrecord-*
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Logs / cache
+logs/
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
