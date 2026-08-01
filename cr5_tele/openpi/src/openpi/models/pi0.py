@@ -63,6 +63,26 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+def _rtc_prefix_weights(
+    start: int | at.Int[at.Array, ""],
+    end: int | at.Int[at.Array, ""],
+    total: int,
+) -> at.Float[at.Array, "{total}"]:
+    """RTC soft mask over the overlapping action prefix.
+
+    ``start`` is the measured/predicted inference delay in control steps.  The
+    prefix before it is fixed hard to the previous chunk.  The interval
+    ``[start, end)`` decays exponentially, matching the public RTC reference
+    implementation.  The suffix from ``end`` onward is unconstrained.
+    """
+    start = jnp.asarray(start, dtype=jnp.float32)
+    end = jnp.maximum(jnp.asarray(end, dtype=jnp.float32), start)
+    index = jnp.arange(total, dtype=jnp.float32)
+    fade = jnp.clip((start - 1.0 - index) / (end - start + 1.0) + 1.0, 0.0, 1.0)
+    weights = fade * jnp.expm1(fade) / (jnp.e - 1.0)
+    return jnp.where(index >= end, 0.0, weights)
+
+
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
@@ -221,6 +241,10 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        rtc_prev_actions: at.Float[at.Array, "b ah ad"] | None = None,
+        rtc_inference_delay: int | at.Int[at.Array, ""] = 0,
+        rtc_prefix_attention_horizon: int | at.Int[at.Array, ""] | None = None,
+        rtc_max_guidance_weight: float | at.Float[at.Array, ""] = 5.0,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -236,8 +260,7 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
-            x_t, time = carry
+        def denoise(x_t, time):
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
@@ -267,6 +290,44 @@ class Pi0(_model.BaseModel):
             )
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return v_t
+
+        rtc_enabled = rtc_prev_actions is not None
+        if rtc_enabled:
+            rtc_prefix_attention_horizon = (
+                self.action_horizon if rtc_prefix_attention_horizon is None else rtc_prefix_attention_horizon
+            )
+            rtc_weights = _rtc_prefix_weights(
+                rtc_inference_delay,
+                rtc_prefix_attention_horizon,
+                self.action_horizon,
+            )[None, :, None]
+
+        def step(carry):
+            x_t, time = carry
+            if rtc_enabled:
+                def x0_from_xt(xt):
+                    v = denoise(xt, time)
+                    # OpenPI samples from t=1 noise to t=0 action, so the
+                    # current final-action estimate is x_0 = x_t - t * v_t.
+                    return xt - time * v, v
+
+                x_0_est, vjp_fn, v_t = jax.vjp(x0_from_xt, x_t, has_aux=True)
+                error = (rtc_prev_actions - x_0_est) * rtc_weights
+                correction = vjp_fn(error)[0]
+                # The OpenPI integration step is x <- x + negative_dt * v.
+                # A positive pseudo-inverse correction in x-space therefore
+                # corresponds to subtracting it from the velocity.
+                time_safe = jnp.maximum(time, 1e-4)
+                inv_noise_scale = time_safe / jnp.maximum(1.0 - time_safe, 1e-4)
+                inv_r2 = (time_safe**2 + (1.0 - time_safe) ** 2) / (time_safe**2)
+                guidance_weight = jnp.minimum(
+                    inv_noise_scale * inv_r2,
+                    jnp.asarray(rtc_max_guidance_weight, dtype=x_t.dtype),
+                )
+                v_t = v_t - guidance_weight * correction
+            else:
+                v_t = denoise(x_t, time)
 
             return x_t + dt * v_t, time + dt
 

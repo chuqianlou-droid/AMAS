@@ -60,7 +60,7 @@ dobot_teleop/
 │  │ 按钮解析     │         │ EMA 滤波             │       │
 │  └──────────────┘         │ 缩放 / 限幅          │       │
 │                           │ 死人开关(RG)         │       │
-│                           │ 夹爪(trigger)        │       │
+│                           │ 夹爪(trigger 控制)    │       │
 │                           └──────────┬──────────┘       │
 │                                      ↓                  │
 │                           ┌─────────────────────┐       │
@@ -102,7 +102,7 @@ pip install datasets pyarrow
 ```
 
 - **TCP-IP-Python-V4** — Dobot 官方 SDK，放在 `cr5_tele/` 下
-  - 路径: `/home/jiaotan/dobot_ws/src/AMAS/cr5_tele/TCP-IP-Python-V4/dobot_api.py`
+  - 路径: `/home/jiaotan/AMAS/cr5_tele/TCP-IP-Python-V4/dobot_api.py`
 
 ---
 
@@ -111,7 +111,7 @@ pip install datasets pyarrow
 ### 测试连接
 
 ```bash
-cd /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop
+cd /home/jiaotan/AMAS/cr5_tele/dobot_teleop
 python3 tests/servop_test_direct.py --robot-ip 192.168.5.1 --dx 10 --enable-robot
 ```
 
@@ -120,7 +120,7 @@ python3 tests/servop_test_direct.py --robot-ip 192.168.5.1 --dx 10 --enable-robo
 **推荐入口 — 在线速度规划器版本**：
 
 ```bash
-cd /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop
+cd /home/jiaotan/AMAS/cr5_tele/dobot_teleop
 
 python3 toolframe_governor_teleop.py \
   --robot-ip 192.168.5.1 \
@@ -163,19 +163,29 @@ python3 toolframe_governor_teleop.py --robot-ip 192.168.5.1 --dry-run
 
 | 字段 | Shape | 说明 |
 |------|-------|------|
-| `observation.state` | (7,) | `[j1, j2, j3, j4, j5, j6, gripper]` |
-| `action` | (7,) | `[dx_mm, dy_mm, dz_mm, dRx_deg, dRy_deg, dRz_deg, gripper]` |
+| `observation.state` | (7,) | `[j1, j2, j3, j4, j5, j6, gripper]`，gripper 为 PGE 实际位置读回，0=张开，1=闭合 |
+| `action` | (7,) | `[dx_mm, dy_mm, dz_mm, dRx_deg, dRy_deg, dRz_deg, gripper]`，前 6 维由真实 gripper_center 轨迹差分得到，第 7 维为下一帧 PGE 实际夹爪状态 |
 | `observation.images.d415` | (224, 224, 3) | D415 相机 RGB |
 | `observation.images.d435` | (224, 224, 3) | D435 相机 RGB |
 
-> **注意**：`observation.state` 不包含 TCP 位姿。TCP 位姿是关节角度的正向运动学结果，属于冗余信息；action 已经编码了位姿变化，policy 只需观测关节状态即可。
+> **注意**：`observation.state` 不包含 TCP 位姿。TCP 位姿是关节角度的正向运动学结果，属于冗余信息。`action` 的前 6 维不是遥操作命令 delta，而是录制到的真实 gripper_center 位姿从当前帧到下一帧的差分；第 7 维 gripper 也不再使用 Quest trigger，而是来自 PGE `0x0202` 当前位置读回换算出的真实夹爪状态。
 
 ### 方式一：录制时直接输出 LeRobot 格式（推荐）
+
+**采集前** — 确保 RealSense Viewer 没有占用相机：
+
+```bash
+pkill -f realsense-viewer || true
+```
 
 **终端 1** — 启动遥操作并发布 action stream：
 
 ```bash
-cd /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop
+cd /home/jiaotan/AMAS/cr5_tele/dobot_teleop
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate teleop_dobot
+
 python3 toolframe_governor_teleop.py \
   --robot-ip 192.168.5.1 \
   --enable-robot --clear-error --auto-enable \
@@ -188,28 +198,47 @@ python3 toolframe_governor_teleop.py \
   --max-linear-speed-mm-s 35 --max-angular-speed-deg-s 20 --max-joint-speed-deg-s 35 \
   --collision-level 1 \
   --enable-gripper \
+  --gripper-state-read-interval-s 0.05 \
   --publish-action-stream --action-stream-host 127.0.0.1 --action-stream-port 5010
 ```
 
 **终端 2** — 录制数据，直接生成 LeRobot parquet：
 
 ```bash
-cd /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop
+cd /home/jiaotan/AMAS/cr5_tele/dobot_teleop
+
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate teleop_dobot
+
 python3 scripts/dataset/record_cr5a_pi0_dataset.py \
   --robot-ip 192.168.5.1 \
+  --d415-serial 841612070371 \
+  --d435-serial 801312070525 \
+  --camera-width 224 --camera-height 224 --camera-fps 15 \
   --output-dir ./datasets/cr5a_lerobot \
   --format lerobot \
   --prompt "pick the object" \
   --duration-sec 40 \
   --action-source teleop \
   --teleop-action-host 127.0.0.1 --teleop-action-port 5010 \
-  --teleop-state-source stream \
+  --teleop-state-source feedback \
   --max-action-age-ms 200 \
   --record-only-when-deadman --drop-no-action \
-  --save-png-frames
+  --preview-frame-count 10
 ```
 
-> 加 `--save-png-frames` 会同时在 `episode_XXXXXX_png/d415/` 和 `d435/` 下保存每帧 PNG，方便肉眼检查相机视角。不需要肉眼检查时可以去掉这个参数节省磁盘空间。
+启动录制后确认终端打印：
+
+```text
+Teleop state source: feedback
+State/image alignment: camera frame -> immediate live ToolVectorActual/QActual sample
+```
+
+同时确认终端 1 的 action stream 日志里 `gripper_state=...` 是数值；张开应接近 0，闭合应接近 1。如果显示 `gripper_state=unavailable`，说明 PGE 当前位置没有成功读回，此时不要继续采新训练数据。
+
+默认录制目录是 `./datasets/cr5a_lerobot`。LeRobot parquet 会写到 `./datasets/cr5a_lerobot/data/chunk-000/episode_XXXXXX.parquet`，元数据写到 `./datasets/cr5a_lerobot/meta/`。`--teleop-state-source feedback` 会在每帧相机图像取到后立即通过 Dobot feedback 端口 `30004` 读取 `ToolVectorActual/QActual`，避免把 Quest 遥操作控制参考当成真实机械臂状态，也不会抢占遥操作正在使用的 Dashboard 端口 `29999`。保存时，action 前 6 维由连续两帧真实 gripper_center 位姿差分生成，第 7 维由遥操作端通过 PGE `0x0202` 当前位置寄存器读回的真实夹爪状态生成，避免继续使用有遥操作延迟的命令 action/trigger。不要用 `--teleop-state-source stream` 采新训练数据，除非只是为了回退/排错。
+
+每个 episode 会自动在 `episode_XXXXXX_preview/d415/` 和 `d435/` 下各保存 10 张均匀抽样 PNG，方便肉眼检查相机视角。如果确实需要导出每一帧，再额外加 `--save-png-frames`。
 
 多次录制到同一个 `--output-dir` 会自动追加 episode。录制完即可直接用于训练，无需转换。
 
@@ -220,12 +249,16 @@ python3 scripts/dataset/record_cr5a_pi0_dataset.py \
 ```bash
 python3 scripts/dataset/record_cr5a_pi0_dataset.py \
   --robot-ip 192.168.5.1 \
+  --d415-serial 841612070371 \
+  --d435-serial 801312070525 \
+  --camera-width 224 --camera-height 224 --camera-fps 15 \
   --output-dir ./datasets/cr5a_raw \
   --prompt "pick the object" \
   --duration-sec 30 \
+  --preview-frame-count 10 \
   --action-source teleop \
   --teleop-action-host 127.0.0.1 --teleop-action-port 5010 \
-  --teleop-state-source stream
+  --teleop-state-source feedback
 ```
 
 批量转换为 LeRobot 格式：
@@ -241,10 +274,14 @@ python3 scripts/dataset/convert_to_lerobot.py \
 ```bash
 python3 scripts/dataset/record_cr5a_pi0_dataset.py \
   --robot-ip 192.168.5.1 \
+  --d415-serial 841612070371 \
+  --d435-serial 801312070525 \
+  --camera-width 224 --camera-height 224 --camera-fps 15 \
   --output-dir ./datasets/cr5a_test \
   --format lerobot \
   --prompt "pick the object" \
   --duration-sec 10 \
+  --preview-frame-count 10 \
   --mock-action zero
 ```
 
@@ -276,15 +313,62 @@ print(f'Action: {ds.meta.shapes[\"action\"]}')
 `scripts/bridge/pi0_cr5a_bridge.py` 将 PI0 输出通过安全路径发送到 CR5A：
 
 ```text
-OpenPI policy server: {"actions": action_chunk}
+OpenPI policy server: {"actions": action_chunk}V
+→ RTC soft-mask inpainting inside PI0 flow sampling
+→ RTC scheduler (delay estimate + stale-prefix skip; no action0 reset on chunk arrival)
 → action adapter (units / axis map / base-or-tool delta)
 → CartesianSafetyEnvelope (workspace + displacement + orientation fence)
 → CartesianTargetGovernor (linear and angular rate limit)
 → ServoP(X,Y,Z,Rx,Ry,Rz,t,aheadtime,gain)
 ```
 
+当前 CR5A 上机脚本默认使用 `--policy-scheduler rtc --rtc-soft-mask`，不是旧的简单异步替换。RTC 调度会在当前 chunk 执行到 `s_min - d_pred` 时后台请求下一次推理；请求里会把上一段剩余 action chunk 作为 `action` 条件传给 OpenPI，OpenPI 在 PI0 flow denoising 内部执行 hard-prefix + exponential soft-mask guidance。新 chunk 返回后，bridge 再按真实经过的控制步数 `d` 跳过 `action[0:d]`，从尚未过期的动作接上，避免“新 chunk 来了又从 action0 开始发”的时间错位。
+
+如果需要回退到只做延迟对齐、不做模型内部 inpainting，可在 bridge 指令里加 `--no-rtc-soft-mask`。修改 OpenPI 代码后需要重启 `serve_policy.py`，否则旧 server 进程不会加载 RTC soft-mask sampler。
+
+### 为什么改成 RTC soft-mask
+
+旧的 `async` 推理逻辑只是在后台请求下一段 action chunk。新 chunk 一回来，如果直接替换旧 chunk 并从 `action[0]` 开始执行，`action[0:d]` 实际上对应的是推理请求发出时的机器人状态；但等推理结果返回时，机械臂已经继续执行了 `d` 个控制周期。这会把“已经过期的动作”再次发给机械臂，表现为动作回拉、停顿、提前闭合或末端对不上物体。
+
+只在 bridge 层跳过 `action[0:d]` 可以解决“过期动作重复执行”，但新 chunk 本身仍然是在不知道旧 chunk 已经执行到哪的情况下独立采样出来的。论文里的 RTC 进一步要求在模型 flow denoising 内部把上一段 chunk 的重叠部分作为条件：前 `d` 个重叠动作 hard mask 固定，后面的重叠区用指数衰减 soft mask 约束，剩余未来动作自由生成。这样新旧 chunk 的连接更连续，不是简单拼接，也不是普通异步替换。
+
+### 具体做了哪些改动
+
+1. OpenPI 模型采样器：`openpi/src/openpi/models/pi0.py`
+   - 新增 `_rtc_prefix_weights()`，生成 hard-prefix + exponential soft-mask 权重。
+   - `sample_actions()` 新增 `rtc_prev_actions`、`rtc_inference_delay`、`rtc_prefix_attention_horizon`、`rtc_max_guidance_weight` 参数。
+   - 在每一步 flow denoising 中计算当前最终动作估计 `x_0 = x_t - t * v_t`，对上一段 chunk 的重叠区做 VJP pseudo-inverse guidance。
+   - 因为 OpenPI 的采样方向是 `t=1` 噪声到 `t=0` 动作，积分步长为负，所以 guidance correction 在 velocity 上使用反号。
+
+2. OpenPI policy server 输入层：`openpi/src/openpi/policies/policy.py`
+   - 从 observation 中取出 `__rtc` 元信息，不让它进入普通 observation。
+   - 复用现有 CR5A transform，把上一段 7D action chunk 按训练时相同的统计量 Normalize，并 Pad 到 PI0 的 32D action 空间。
+   - 把处理后的 `actions` 作为 `rtc_prev_actions` 传给 `sample_actions()`。
+
+3. CR5A observation provider：`scripts/bridge/cr5a_observation_provider.py`
+   - 普通请求仍然给 `action=0` 占位。
+   - RTC 请求时把 bridge 传来的上一段剩余 action chunk 写入 `action` 字段，并附带 `__rtc`。
+
+4. CR5A bridge 调度器：`scripts/bridge/pi0_cr5a_bridge.py`
+   - 新增 `--policy-scheduler rtc`、`--rtc-soft-mask/--no-rtc-soft-mask`、`--rtc-max-guidance-weight` 等参数。
+   - 记录当前完整 chunk、已执行步数 `chunk_elapsed`、历史推理延迟，并预测下一次 `d_pred`。
+   - 当执行到 `s_min - d_pred` 时发起下一次后台推理。
+   - 后续 RTC 请求会把当前 chunk 从 `chunk_elapsed` 开始的剩余动作左对齐传给 OpenPI，作为 soft-mask 条件。
+   - 新 chunk 返回后按真实 elapsed step 跳过 `action[0:d]`，从未过期动作继续执行。
+
+5. 上机脚本：`scripts/bridge/run_pi0_cr5a_servoj.sh`
+   - 默认启用 `--policy-scheduler rtc --rtc-soft-mask`。
+   - 当前配置使用 `--open-loop-horizon 33`、`--rtc-min-execution-horizon 33`、`--policy-prefetch-remaining 8`。
+
+推荐直接运行：
+
 ```bash
-cd /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop
+cd /home/jiaotan/AMAS/cr5_tele/dobot_teleop
+bash scripts/bridge/run_pi0_cr5a_servoj.sh "pick the object"
+```
+
+```bash
+cd /home/jiaotan/AMAS/cr5_tele/dobot_teleop
 
 # Dry-run 验证
 python3 scripts/bridge/pi0_cr5a_bridge.py \
@@ -300,6 +384,8 @@ python3 scripts/bridge/pi0_cr5a_bridge.py \
   --policy-host 127.0.0.1 --policy-port 8000 \
   --observation-provider /path/to/cr5a_observation.py:make_observation \
   --instruction "pick up the object" \
+  --policy-scheduler rtc \
+  --rtc-soft-mask \
   --action-format cartesian_delta_mm_deg \
   --delta-frame tool \
   --command-rate 10 --max-linear-speed-mm-s 30 --max-angular-speed-deg-s 15 \
@@ -375,10 +461,12 @@ python3 scripts/bridge/pi0_cr5a_bridge.py \
 
 | 参数 | 默认值 | 作用 |
 |------|--------|------|
-| `--use-gripper-center-pose` | true | 数据集记录 gripper_center 位姿 |
+| `--use-gripper-center-pose` | true | 将实时 TCP 位姿通过工具偏移映射到 gripper_center |
 | `--tool-offset-z-mm` | 160.0 | TCP 局部 Z 轴偏移量 |
 | `--controller-tool-offset-already-set` | false | 控制器已设工具偏移则跳过软件变换 |
 | `--log-pose-diff` | false | 1Hz 打印 raw_tcp vs gripper_center 差异 |
+
+录制脚本会先通过 Dobot feedback 端口读取实时 `ToolVectorActual/QActual`；如果显式选择 `--teleop-state-source dashboard`，才会改用 Dashboard `GetPose/GetAngle`，但这通常会与遥操作端抢占 `29999`。在默认 `--use-gripper-center-pose` 下，`ToolVectorActual` 返回的 raw TCP/末端法兰位姿会经过 `tool-offset-z-mm=160` 的软件工具偏移，计算出夹爪中心 `gripper_center` 位姿。Legacy raw 格式会把这个 gripper_center 作为主 `tcp_pose` 保存；LeRobot 格式的 `observation.state` 仍只保存 `[j1..j6, gripper]`，其中 gripper 是 PGE 实际位置读回，不直接保存笛卡尔位姿。
 
 ---
 

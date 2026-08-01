@@ -21,9 +21,11 @@ if _PROJ_ROOT not in sys.path:
     sys.path.insert(0, _PROJ_ROOT)
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 from dobot_teleop.cr5a_pi0_schema import CR5A_ACTION_DIM, CR5A_ACTION_KEYS, build_cr5a_observation, validate_cr5a_action
 from dobot_teleop.dobot_dashboard import DobotDashboard, DobotDashboardError, format_pose
+from dobot_teleop.dobot_feedback import DobotFeedbackClient, DobotFeedbackError
 from dobot_teleop.lerobot_writer import LerobotWriter
 from dobot_teleop.realsense_dual_rgb_provider import DualRealSenseRGBProvider
 from dobot_teleop.teleop_action_stream import TeleopAction, TeleopActionSubscriber
@@ -36,6 +38,9 @@ from dobot_teleop.transforms import (
 )
 
 
+DEFAULT_LEROBOT_OUTPUT_DIR = Path(_PROJ_ROOT) / "datasets" / "cr5a_lerobot"
+
+
 @dataclass(frozen=True)
 class ActionSample:
     """A recorder-ready action plus the stream metadata for one observation."""
@@ -46,6 +51,7 @@ class ActionSample:
     deadman: bool
     servo_sent: bool
     gripper_command: float
+    gripper_state: float
     controller_pose: np.ndarray | None = None
     controller_joints: np.ndarray | None = None
     gripper_center_pose: np.ndarray | None = None
@@ -61,6 +67,11 @@ def teleop_action_sample(
     age_ms = (now_s - action.timestamp) * 1000.0
     if age_ms < -1000.0 or age_ms > max_action_age_ms:
         return None, "stale_action"
+    gripper_state = (
+        action.gripper_command
+        if action.gripper_state is None
+        else action.gripper_state
+    )
     return (
         ActionSample(
             action=validate_cr5a_action(action.action),
@@ -69,6 +80,7 @@ def teleop_action_sample(
             deadman=action.deadman,
             servo_sent=action.servo_sent,
             gripper_command=float(np.clip(action.gripper_command, 0.0, 1.0)),
+            gripper_state=float(np.clip(gripper_state, 0.0, 1.0)),
             controller_pose=np.asarray(action.current_pose, dtype=np.float32),
             controller_joints=(
                 None
@@ -101,6 +113,70 @@ def _require_pillow():
 def _write_rgb_png(path: Path, image: np.ndarray) -> None:
     Image = _require_pillow()
     Image.fromarray(np.asarray(image, dtype=np.uint8), mode="RGB").save(path)
+
+
+def _preview_indices(frame_count: int, preview_count: int) -> list[int]:
+    if frame_count <= 0 or preview_count <= 0:
+        return []
+    count = min(frame_count, preview_count)
+    return sorted(set(np.linspace(0, frame_count - 1, count).round().astype(int).tolist()))
+
+
+def _write_preview_frames(
+    preview_dir: Path,
+    *,
+    images_d415: list[np.ndarray],
+    images_d435: list[np.ndarray],
+    preview_count: int,
+) -> None:
+    indices = _preview_indices(len(images_d415), preview_count)
+    if not indices:
+        return
+    d415_dir = preview_dir / "d415"
+    d435_dir = preview_dir / "d435"
+    d415_dir.mkdir(parents=True, exist_ok=True)
+    d435_dir.mkdir(parents=True, exist_ok=True)
+    for order, frame_index in enumerate(indices):
+        _write_rgb_png(d415_dir / f"{order:02d}_frame_{frame_index:06d}.png", images_d415[frame_index])
+        _write_rgb_png(d435_dir / f"{order:02d}_frame_{frame_index:06d}.png", images_d435[frame_index])
+
+
+def _pose_action_delta_mm_deg(reference: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Return base-frame pose delta [dx,dy,dz,dRx,dRy,dRz] from two pose samples."""
+    reference = np.asarray(reference, dtype=np.float32).reshape(6)
+    target = np.asarray(target, dtype=np.float32).reshape(6)
+    position = target[:3] - reference[:3]
+    reference_R = R.from_euler("XYZ", reference[3:], degrees=True).as_matrix()
+    target_R = R.from_euler("XYZ", target[3:], degrees=True).as_matrix()
+    rotation = R.from_matrix(target_R @ reference_R.T).as_euler("XYZ", degrees=True)
+    return np.concatenate([position, rotation.astype(np.float32)]).astype(np.float32)
+
+
+def _feedback_delta_actions(
+    poses: list[np.ndarray],
+    gripper_states: list[float],
+) -> np.ndarray:
+    """Build CR5A 7D actions from the recorded real robot pose trajectory.
+
+    The first six dimensions are the measured gripper-center pose delta from
+    frame i to i+1.  The gripper dimension is the measured PGE gripper target
+    state at frame i+1, so the label comes from real gripper motion instead of
+    the Quest trigger command.
+    """
+    frame_count = len(poses)
+    if frame_count != len(gripper_states):
+        raise ValueError("Pose and gripper state counts must match")
+    if frame_count == 0:
+        return np.zeros((0, CR5A_ACTION_DIM), dtype=np.float32)
+
+    actions = np.zeros((frame_count, CR5A_ACTION_DIM), dtype=np.float32)
+    for index in range(frame_count - 1):
+        actions[index, :6] = _pose_action_delta_mm_deg(poses[index], poses[index + 1])
+        actions[index, 6] = float(gripper_states[index + 1])
+    actions[-1, 6] = float(gripper_states[-1])
+    for action in actions:
+        validate_cr5a_action(action)
+    return actions
 
 
 def _episode_path(root: Path, episode_index: int | None) -> Path:
@@ -281,7 +357,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--robot-ip", required=True)
     parser.add_argument("--dashboard-port", type=int, default=29999)
-    parser.add_argument("--d415-serial", default="021422061498")
+    parser.add_argument("--feedback-port", type=int, default=30004)
+    parser.add_argument("--d415-serial", default="841612070371")
     parser.add_argument("--d435-serial", default="801312070525")
     parser.add_argument("--camera-width", type=int, default=224)
     parser.add_argument("--camera-height", type=int, default=224)
@@ -296,9 +373,10 @@ def parse_args() -> argparse.Namespace:
                         help="Abort after this many RealSense frame read failures; use 0 to never abort")
     parser.add_argument("--no-restart-cameras-on-failure", action="store_true",
                         help="Do not restart RealSense pipelines after a failed frame read")
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_LEROBOT_OUTPUT_DIR,
+                        help=f"Dataset output directory (default: {DEFAULT_LEROBOT_OUTPUT_DIR})")
     parser.add_argument("--episode-index", type=int)
-    parser.add_argument("--format", choices=("raw", "lerobot"), default="raw",
+    parser.add_argument("--format", choices=("raw", "lerobot"), default="lerobot",
                         help="Output format: 'raw' = cr5a_pi0_raw_v1 (legacy), "
                              "'lerobot' = LeRobot v2.1 parquet (directly usable for training)")
     parser.add_argument("--prompt", required=True)
@@ -311,8 +389,10 @@ def parse_args() -> argparse.Namespace:
                         help="UDP host for --action-source teleop")
     parser.add_argument("--teleop-action-port", type=int, default=5010,
                         help="UDP port for --action-source teleop")
-    parser.add_argument("--teleop-state-source", choices=("stream", "dashboard"), default="stream",
-                        help="stream avoids a second Dashboard connection; dashboard reads GetPose/GetAngle directly")
+    parser.add_argument("--teleop-state-source", choices=("stream", "feedback", "dashboard"), default="feedback",
+                        help="feedback reads live ToolVectorActual/QActual from port 30004 after each camera frame; "
+                             "dashboard reads live GetPose/GetAngle from port 29999; "
+                             "stream uses the teleop command reference for legacy recordings")
     parser.add_argument("--max-action-age-ms", type=float, default=200.0,
                         help="Treat teleop actions older than this as invalid")
     parser.add_argument("--drop-no-action", action="store_true",
@@ -321,6 +401,8 @@ def parse_args() -> argparse.Namespace:
                         help="For teleop source, save only frames whose action reports deadman=true")
     parser.add_argument("--save-png-frames", action="store_true",
                         help="Also export each frame's d415/d435 images as PNG files for visual inspection")
+    parser.add_argument("--preview-frame-count", type=int, default=10,
+                        help="Save this many evenly sampled d415/d435 PNG previews per episode; use 0 to disable")
 
     # ── Tool offset configuration ─────────────────────────────────────────
     parser.add_argument("--use-gripper-center-pose", action="store_true", default=True,
@@ -362,6 +444,8 @@ def main() -> None:
         raise SystemExit("--camera-retry-timeout-ms must be positive")
     if args.max_camera_failures < 0:
         raise SystemExit("--max-camera-failures must not be negative")
+    if args.preview_frame_count < 0:
+        raise SystemExit("--preview-frame-count must not be negative")
 
     # ── Tool offset configuration ──────────────────────────────────────────
     tool_offset_cfg = ToolOffsetConfig(
@@ -392,12 +476,19 @@ def main() -> None:
                   f"(episodes so far: {lerobot_writer._episode_index})")
 
     episode_dir = _episode_path(args.output_dir, args.episode_index) if args.format == "raw" else None
-    # Dobot controllers often allow only one Dashboard client.  During a real
-    # demonstration the teleop process owns that connection, so the recorder
-    # defaults to the pose/joint reference included in its UDP action stream.
-    client = (
+    # For training, prefer live robot feedback over the teleop command
+    # reference.  The feedback port does not steal the Dashboard connection
+    # used by the teleop controller.
+    if args.action_source == "mock" and args.teleop_state_source == "stream":
+        raise SystemExit("--teleop-state-source stream requires --action-source teleop")
+    dashboard_client = (
         DobotDashboard(args.robot_ip, args.dashboard_port, timeout=0.8)
-        if args.action_source == "mock" or args.teleop_state_source == "dashboard"
+        if args.teleop_state_source == "dashboard"
+        else None
+    )
+    feedback_client = (
+        DobotFeedbackClient(args.robot_ip, args.feedback_port, timeout=0.8)
+        if args.teleop_state_source == "feedback"
         else None
     )
     camera = DualRealSenseRGBProvider(
@@ -421,13 +512,12 @@ def main() -> None:
     gripper_center_poses: list[np.ndarray] = []  # primary training pose
     joints_list: list[np.ndarray] = []
     grippers: list[float] = []
-    actions: list[np.ndarray] = []
     timestamps: list[float] = []
     action_timestamps: list[float] = []
     action_ages_ms: list[float] = []
     deadman_states: list[bool] = []
     servo_sent_states: list[bool] = []
-    gripper_actions: list[float] = []
+    gripper_states: list[float] = []
     previous_pose: np.ndarray | None = None
     interrupted = False
     failure: Exception | None = None
@@ -442,6 +532,10 @@ def main() -> None:
     if action_subscriber is not None:
         print(f"Action source: teleop UDP {args.teleop_action_host}:{args.teleop_action_port}")
         print(f"Teleop state source: {args.teleop_state_source}")
+        if args.teleop_state_source == "feedback":
+            print("State/image alignment: camera frame -> immediate live ToolVectorActual/QActual sample")
+        elif args.teleop_state_source == "dashboard":
+            print("State/image alignment: camera frame -> immediate live GetPose/GetAngle sample")
     else:
         print(f"Action source: mock ({args.mock_action})")
     print("Keys: press s/S to stop and save, Ctrl+C=interrupt and save")
@@ -488,8 +582,10 @@ def main() -> None:
     kb_thread.start()
 
     try:
-        if client is not None:
-            client.connect()
+        if dashboard_client is not None:
+            dashboard_client.connect()
+        if feedback_client is not None:
+            feedback_client.connect()
         camera.start()
         deadline = time.monotonic() + args.duration_sec
         period = 1.0 / record_rate
@@ -524,6 +620,7 @@ def main() -> None:
                         deadman=False,
                         servo_sent=False,
                         gripper_command=0.0,
+                        gripper_state=0.0,
                     )
                 if args.record_only_when_deadman and not sample.deadman:
                     frames_dropped_deadman += 1
@@ -534,6 +631,7 @@ def main() -> None:
                 break
             try:
                 d435, d415 = camera.get_rgb_images()
+                image_timestamp_s = time.time()
             except RuntimeError as exc:
                 frames_dropped_camera += 1
                 print(
@@ -556,9 +654,17 @@ def main() -> None:
                 raw_tcp = sample.controller_pose
                 joints = sample.controller_joints
             else:
-                assert client is not None
-                raw_tcp = np.asarray(client.get_pose(), dtype=np.float32)
-                joints = np.asarray(client.get_angle(), dtype=np.float32)
+                # Read real robot feedback directly after the camera frame.
+                # This keeps image/state aligned to the physical CR5A instead
+                # of the Quest/teleop command reference, which can be delayed.
+                if feedback_client is not None:
+                    pose_values, joint_values = feedback_client.read_state()
+                else:
+                    assert dashboard_client is not None
+                    pose_values = dashboard_client.get_pose()
+                    joint_values = dashboard_client.get_angle()
+                raw_tcp = np.asarray(pose_values, dtype=np.float32)
+                joints = np.asarray(joint_values, dtype=np.float32)
 
             # ── Apply tool offset: TCP → gripper center ──────────────────
             raw_tcp_list = raw_tcp.tolist()
@@ -575,22 +681,22 @@ def main() -> None:
                     deadman=False,
                     servo_sent=False,
                     gripper_command=0.0,
+                    gripper_state=0.0,
                 )
             assert sample is not None
-            build_cr5a_observation(d435, d415, pose, joints, sample.gripper_command, args.prompt)
+            build_cr5a_observation(d435, d415, pose, joints, sample.gripper_state, args.prompt)
             images_d435.append(d435)
             images_d415.append(d415)
             tcp_poses.append(raw_tcp)                          # raw TCP (debug)
             gripper_center_poses.append(pose)                  # gripper_center (primary)
             joints_list.append(joints)
-            grippers.append(0.0)  # TODO: add CR5A gripper position readback when the wrapper exposes it.
-            actions.append(validate_cr5a_action(sample.action))
-            timestamps.append(time.time())
+            grippers.append(sample.gripper_state)
+            timestamps.append(image_timestamp_s)
             action_timestamps.append(sample.timestamp)
             action_ages_ms.append(sample.age_ms)
             deadman_states.append(sample.deadman)
             servo_sent_states.append(sample.servo_sent)
-            gripper_actions.append(sample.gripper_command)
+            gripper_states.append(sample.gripper_state)
             previous_pose = pose
 
             # ── Periodic pose diff logging (1 Hz) ────────────────────────
@@ -603,13 +709,14 @@ def main() -> None:
                 print(
                     f"Frame {len(timestamps)} | action_age={sample.age_ms:.1f}ms | "
                     f"deadman={sample.deadman} | servo_sent={sample.servo_sent} | "
-                    f"action={np.array2string(sample.action, precision=3)}"
+                    f"gripper_state={sample.gripper_state:.3f} | "
+                    f"teleop_action={np.array2string(sample.action, precision=3)}"
                 )
     except KeyboardInterrupt:
         interrupted = True
         stop_event.set()
         print("Recording interrupted (Ctrl+C); saving captured frames.")
-    except (OSError, RuntimeError, ValueError, DobotDashboardError) as exc:
+    except (OSError, RuntimeError, ValueError, DobotDashboardError, DobotFeedbackError) as exc:
         failure = exc
         print(f"Recording stopped due to error: {exc}")
     finally:
@@ -617,12 +724,15 @@ def main() -> None:
         if sys.stdin.isatty():
             kb_thread.join(timeout=0.3)
         camera.close()
-        if client is not None:
-            client.close()
+        if dashboard_client is not None:
+            dashboard_client.close()
+        if feedback_client is not None:
+            feedback_client.close()
         if action_subscriber is not None:
             action_subscriber.close()
 
     if timestamps:
+        actions_arr = _feedback_delta_actions(gripper_center_poses, gripper_states)
         if args.format == "lerobot":
             print(f"Saving {len(timestamps)} frames to LeRobot dataset...", flush=True)
             # ── 直接写入 LeRobot 格式 ──────────────────────────────────────
@@ -636,7 +746,6 @@ def main() -> None:
                 ],
                 axis=1,
             )  # (N, 7)
-            actions_arr = np.stack(actions).astype(np.float32)
             ep_idx = lerobot_writer.add_episode(
                 obs_state=obs_state,
                 actions=actions_arr,
@@ -645,9 +754,18 @@ def main() -> None:
                 prompt=args.prompt,
             )
             print(f"Saved {len(timestamps)} frames → LeRobot episode {ep_idx} in {args.output_dir}")
+            preview_dir = Path(args.output_dir) / f"episode_{ep_idx:06d}_preview"
+            _write_preview_frames(
+                preview_dir,
+                images_d415=images_d415,
+                images_d435=images_d435,
+                preview_count=args.preview_frame_count,
+            )
+            if args.preview_frame_count > 0:
+                print(f"  ↳ Preview PNG frames → {preview_dir}")
             # ── 可选: 同时导出 PNG 方便肉眼检查 ──────────────────────────
             if args.save_png_frames:
-                print("Saving PNG preview frames...", flush=True)
+                print("Saving all PNG frames...", flush=True)
                 from PIL import Image as PILImage
                 png_dir = Path(args.output_dir) / f"episode_{ep_idx:06d}_png"
                 d415_dir = png_dir / "d415"
@@ -670,18 +788,20 @@ def main() -> None:
                 tcp_pose=np.stack(gripper_center_poses),  # primary = gripper_center
                 joints=np.stack(joints_list),
                 gripper=np.asarray(grippers),
-                actions=np.stack(actions),
+                actions=actions_arr,
                 timestamps=np.asarray(timestamps),
                 prompt=args.prompt,
                 action_timestamps=np.asarray(action_timestamps),
                 action_age_ms=np.asarray(action_ages_ms),
                 deadman=np.asarray(deadman_states),
                 servo_sent=np.asarray(servo_sent_states),
-                gripper_action=np.asarray(gripper_actions),
+                gripper_action=np.asarray(gripper_states),
                 metadata={
                     "completed": failure is None and not interrupted,
                     "robot": "dobot_cr5a",
                     "action_source": args.action_source,
+                    "action_label_source": "feedback_gripper_center_delta_and_pge_next_state",
+                    "gripper_state_source": "teleop_action_stream_pge_current_position_0x0202",
                     "action_dim": CR5A_ACTION_DIM,
                     "duration_sec": args.duration_sec,
                     "mock_action": args.mock_action,
@@ -691,18 +811,32 @@ def main() -> None:
                     "teleop_action_host": args.teleop_action_host if action_subscriber is not None else None,
                     "teleop_action_port": args.teleop_action_port if action_subscriber is not None else None,
                     "max_action_age_ms": args.max_action_age_ms,
-                    "teleop_state_source": args.teleop_state_source if action_subscriber is not None else "dashboard",
+                    "teleop_state_source": args.teleop_state_source,
+                    "feedback_port": args.feedback_port if feedback_client is not None else None,
                     "pose_frame": tool_offset_cfg.frame_name if tool_offset_cfg.effective() else "tcp",
                     "tool_offset_mm": list(tool_offset_cfg.xyz_mm) if tool_offset_cfg.effective() else None,
                     "state_note": (
                         "Teleop stream state is the controller's last command reference, not an extra GetPose sample."
                         if args.action_source == "teleop" and args.teleop_state_source == "stream"
-                        else "State was read directly through Dobot Dashboard GetPose/GetAngle."
+                        else (
+                            "State was read directly through Dobot feedback ToolVectorActual/QActual immediately after the camera frame."
+                            if args.teleop_state_source == "feedback"
+                            else "State was read directly through Dobot Dashboard GetPose/GetAngle immediately after the camera frame."
+                        )
                     ),
                 },
             )
             print(f"Saved {len(timestamps)} frames to {episode_dir}")
-            nonzero_ratio = float(np.mean(np.any(np.abs(np.stack(actions)) > 1e-6, axis=1)))
+            preview_dir = Path(args.output_dir) / f"{episode_dir.name}_preview"
+            _write_preview_frames(
+                preview_dir,
+                images_d415=images_d415,
+                images_d435=images_d435,
+                preview_count=args.preview_frame_count,
+            )
+            if args.preview_frame_count > 0:
+                print(f"  ↳ Preview PNG frames → {preview_dir}")
+            nonzero_ratio = float(np.mean(np.any(np.abs(actions_arr) > 1e-6, axis=1)))
             print(f"Nonzero action ratio: {nonzero_ratio:.3f}")
     print(f"Frames seen: {frames_seen}")
     print(f"Frames dropped no action: {frames_dropped_no_action}")

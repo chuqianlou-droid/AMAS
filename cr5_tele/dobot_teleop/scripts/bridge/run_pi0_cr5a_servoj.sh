@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/jiaotan/dobot_ws/src/AMAS/cr5_tele/dobot_teleop
+cd /home/jiaotan/AMAS/cr5_tele/dobot_teleop
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate teleop_dobot
 
-export PYTHONPATH=/home/jiaotan/dobot_ws/src/AMAS/cr5_tele/openpi/packages/openpi-client/src:${PYTHONPATH:-}
-export CR5A_D415_SERIAL=${CR5A_D415_SERIAL:-021422061498}
+export PYTHONPATH=/home/jiaotan/AMAS/cr5_tele/openpi/packages/openpi-client/src:${PYTHONPATH:-}
+export CR5A_D415_SERIAL=${CR5A_D415_SERIAL:-841612070371}
 export CR5A_D435_SERIAL=${CR5A_D435_SERIAL:-801312070525}
 
 INSTRUCTION="${1:-pick the object}"
@@ -19,9 +19,8 @@ python3 scripts/bridge/pi0_cr5a_bridge.py \
   --action-format cartesian_delta_mm_deg \
   --delta-frame base \
   --servo-mode joint \
-  --command-rate 15 \
+  --command-rate 25 \
   --servo-t 0.067 \
-  --open-loop-horizon 10 \
   --servo-aheadtime 100 \
   --servo-gain 200 \
   --target-lowpass-alpha 0.25 \

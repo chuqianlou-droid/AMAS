@@ -1,10 +1,16 @@
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 
 import numpy as np
 
-from record_cr5a_pi0_dataset import teleop_action_sample, write_raw_episode
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts" / "dataset"))
+sys.path.insert(0, str(ROOT / "dobot_teleop"))
+
+from record_cr5a_pi0_dataset import _feedback_delta_actions, teleop_action_sample, write_raw_episode
 from teleop_action_stream import TeleopAction
 
 
@@ -56,10 +62,28 @@ class Cr5aDatasetFormatTest(unittest.TestCase):
             deadman=True,
             servo_sent=True,
             gripper_command=0.0,
+            gripper_state=0.25,
         )
         sample, reason = teleop_action_sample(stream_action, now_s=10.1, max_action_age_ms=200)
         self.assertIsNotNone(sample)
         self.assertIsNone(reason)
+        self.assertEqual(sample.gripper_state, 0.25)
         stale, reason = teleop_action_sample(stream_action, now_s=10.3, max_action_age_ms=200)
         self.assertIsNone(stale)
         self.assertEqual(reason, "stale_action")
+
+    def test_feedback_delta_actions_use_recorded_pose_differences(self):
+        poses = [
+            np.array([0, 0, 0, 0, 0, 0], dtype=np.float32),
+            np.array([1, 2, 3, 0, 0, 10], dtype=np.float32),
+            np.array([3, 5, 9, 0, 0, 15], dtype=np.float32),
+        ]
+        actions = _feedback_delta_actions(poses, [0.0, 0.5, 1.0])
+
+        self.assertEqual(actions.shape, (3, 7))
+        np.testing.assert_allclose(actions[0, :3], [1, 2, 3], atol=1e-6)
+        np.testing.assert_allclose(actions[0, 3:6], [0, 0, 10], atol=1e-6)
+        np.testing.assert_allclose(actions[1, :3], [2, 3, 6], atol=1e-6)
+        np.testing.assert_allclose(actions[1, 3:6], [0, 0, 5], atol=1e-6)
+        np.testing.assert_allclose(actions[2, :6], np.zeros(6), atol=1e-6)
+        np.testing.assert_allclose(actions[:, 6], [0.5, 1.0, 1.0], atol=1e-6)

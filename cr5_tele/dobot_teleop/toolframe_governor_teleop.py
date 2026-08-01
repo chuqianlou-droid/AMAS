@@ -79,6 +79,8 @@ class PgeModbusGripper:
     REG_POSITION = 0x0103
     REG_SPEED = 0x0104
     REG_INIT_STATUS = 0x0200
+    REG_GRIP_STATUS = 0x0201
+    REG_CURRENT_POSITION = 0x0202
     COMMAND_DELAY_S = 0.08
 
     def __init__(
@@ -95,6 +97,9 @@ class PgeModbusGripper:
         close_position: int,
         trigger_threshold: float,
         init_timeout_s: float,
+        open_threshold: float = 0.25,
+        min_command_interval_s: float = 0.0,
+        state_read_interval_s: float = 0.05,
     ):
         self.client = client
         self.slave_id = slave_id
@@ -108,8 +113,15 @@ class PgeModbusGripper:
         self.close_position = close_position
         self.trigger_threshold = trigger_threshold
         self.init_timeout_s = init_timeout_s
+        self.open_threshold = open_threshold
+        self.min_command_interval_s = min_command_interval_s
+        self.state_read_interval_s = max(0.0, state_read_interval_s)
         self.index: Optional[int] = None
         self.closed: Optional[bool] = None
+        self.last_command_time_s = 0.0
+        self.last_state_read_time_s = -float("inf")
+        self.last_state_warning_time_s = -float("inf")
+        self.last_closedness: Optional[float] = None
 
     def initialize(self, init_value: int = 1) -> None:
         print("Initializing PGE gripper via tool RS485 / Modbus-RTU.")
@@ -147,17 +159,24 @@ class PgeModbusGripper:
             self.index = None
 
     def update_from_trigger(self, trigger_value: float) -> None:
-        want_closed = trigger_value >= self.trigger_threshold
-        self.command_closed(want_closed)
+        if self.closed:
+            if trigger_value <= self.open_threshold:
+                self.command_closed(False)
+        elif trigger_value >= self.trigger_threshold:
+            self.command_closed(True)
 
     def command_closed(self, closed: bool, force: bool = False) -> None:
         if self.index is None:
             return
         if not force and self.closed == closed:
             return
+        now = time.monotonic()
+        if not force and now - self.last_command_time_s < self.min_command_interval_s:
+            return
         position = self.close_position if closed else self.open_position
         self.write_u16(self.REG_POSITION, position)
         self.closed = closed
+        self.last_command_time_s = now
         state = "closed" if closed else "open"
         print(f"Gripper {state}: trigger position={position}")
 
@@ -192,6 +211,28 @@ class PgeModbusGripper:
                 f"GetHoldRegs returned no value for addr={addr}: {response}"
             )
         return int(values[0])
+
+    def read_closedness(self) -> float:
+        """Read actual PGE position as 0.0=open, 1.0=closed."""
+        position = self.read_u16(self.REG_CURRENT_POSITION)
+        span = float(self.close_position - self.open_position)
+        if abs(span) < 1e-6:
+            raise DobotDashboardError("Gripper open and close positions must differ")
+        return clamp((float(position) - float(self.open_position)) / span, 0.0, 1.0)
+
+    def read_closedness_cached(self, now_s: float | None = None) -> Optional[float]:
+        """Return recent actual gripper closedness without blocking every tick."""
+        now_s = time.monotonic() if now_s is None else now_s
+        if now_s - self.last_state_read_time_s < self.state_read_interval_s:
+            return self.last_closedness
+        self.last_state_read_time_s = now_s
+        try:
+            self.last_closedness = self.read_closedness()
+        except DobotDashboardError as exc:
+            if now_s - self.last_state_warning_time_s >= 2.0:
+                print(f"WARNING: cannot read PGE current position 0x0202: {exc}")
+                self.last_state_warning_time_s = now_s
+        return self.last_closedness
 
     def wait_initialized(self) -> None:
         deadline = time.monotonic() + self.init_timeout_s
@@ -535,6 +576,8 @@ def parse_args():
     parser.add_argument("--gripper-open-position", type=int, default=1000)
     parser.add_argument("--gripper-close-position", type=int, default=0)
     parser.add_argument("--gripper-trigger-threshold", type=float, default=0.5)
+    parser.add_argument("--gripper-state-read-interval-s", type=float, default=0.05,
+                        help="Minimum interval between PGE current-position readbacks for the action stream")
     parser.add_argument("--gripper-init-value", type=lambda value: int(value, 0),
                         default=1,
                         help="PGE init value: 1=single direction, 0xA5=full init")
@@ -747,7 +790,8 @@ def main():
     if args.enable_gripper:
         print(
             "Gripper enabled: Quest right trigger controls PGE gripper "
-            f"(threshold={args.gripper_trigger_threshold:.2f})"
+            f"(threshold={args.gripper_trigger_threshold:.2f}); "
+            "action stream publishes actual PGE position readback when available"
         )
     if action_publisher is not None:
         print(f"Teleop action stream enabled: udp://{args.action_stream_host}:{args.action_stream_port}")
@@ -778,6 +822,7 @@ def main():
                     close_position=args.gripper_close_position,
                     trigger_threshold=args.gripper_trigger_threshold,
                     init_timeout_s=args.gripper_init_timeout,
+                    state_read_interval_s=args.gripper_state_read_interval_s,
                 )
                 gripper.initialize(init_value=args.gripper_init_value)
 
@@ -1055,11 +1100,13 @@ def main():
                             continue
 
                 gripper_cmd = QuestTeleopMapper.gripper_from_trigger(latest_pose)
+                gripper_state: Optional[float] = None
                 if args.enable_gripper:
                     if args.dry_run:
                         pass
                     elif gripper is not None:
                         gripper.update_from_trigger(gripper_cmd)
+                        gripper_state = gripper.read_closedness_cached(now)
 
                 if servo_sent:
                     action = pose_action_delta_mm_deg(prev_cmd_target, cmd_target) + [gripper_cmd]
@@ -1081,12 +1128,19 @@ def main():
                         deadman=rg_pressed,
                         servo_sent=servo_sent,
                         gripper_command=gripper_cmd,
+                        gripper_state=gripper_state,
                     )
                     published = action_publisher.publish(stream_action)
                     if now - last_action_stream_log_time >= 1.0:
+                        state_text = (
+                            "unavailable"
+                            if stream_action.gripper_state is None
+                            else f"{stream_action.gripper_state:.3f}"
+                        )
                         print(
                             f"Published action seq={stream_action.seq} servo_sent={servo_sent} "
                             f"deadman={rg_pressed} action={stream_action.action} "
+                            f"gripper_state={state_text} "
                             f"udp={'ok' if published else 'dropped'}"
                         )
                         last_action_stream_log_time = now

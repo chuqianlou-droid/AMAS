@@ -359,12 +359,25 @@ def parse_args() -> argparse.Namespace:
     source.add_argument("--observation-provider", help="/path/provider.py:function for websocket inference")
     source.add_argument("--actions-jsonl", help="JSONL action chunks; intended for dry-run/calibration")
     parser.add_argument("--policy-action-key", default="actions")
+    parser.add_argument("--policy-scheduler", choices=("sync", "async", "rtc"), default="async",
+                        help="sync waits for each chunk; async is legacy chunk replacement; "
+                             "rtc uses delay-aligned real-time chunk execution")
     parser.add_argument("--open-loop-horizon", type=int, default=1,
                         help="Actions to execute from a returned PI0 action chunk before querying again")
     parser.add_argument("--async-policy", action=argparse.BooleanOptionalAction, default=True,
                         help="Run the next policy inference in the background while executing queued actions")
     parser.add_argument("--policy-prefetch-remaining", type=int, default=4,
                         help="Start async inference when this many queued actions remain")
+    parser.add_argument("--rtc-min-execution-horizon", type=int, default=0,
+                        help="Minimum RTC execution horizon s_min; 0 reuses --open-loop-horizon")
+    parser.add_argument("--rtc-delay-history", type=int, default=8,
+                        help="Number of previous inference delays used for conservative RTC delay prediction")
+    parser.add_argument("--rtc-delay-safety-margin", type=int, default=1,
+                        help="Extra control steps added to RTC's predicted inference delay")
+    parser.add_argument("--rtc-soft-mask", action=argparse.BooleanOptionalAction, default=True,
+                        help="Send the previous action chunk to OpenPI for RTC soft-mask inpainting")
+    parser.add_argument("--rtc-max-guidance-weight", type=float, default=5.0,
+                        help="Maximum model-internal RTC guidance weight for soft-mask inpainting")
     parser.add_argument("--instruction", default="", help="Passed unchanged to the observation provider")
 
     parser.add_argument(
@@ -485,6 +498,16 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--open-loop-horizon must be positive")
     if args.policy_prefetch_remaining < 0:
         raise ValueError("--policy-prefetch-remaining must not be negative")
+    if args.policy_scheduler == "rtc" and not args.async_policy:
+        raise ValueError("--policy-scheduler rtc requires --async-policy")
+    if args.rtc_min_execution_horizon < 0:
+        raise ValueError("--rtc-min-execution-horizon must not be negative")
+    if args.rtc_delay_history <= 0:
+        raise ValueError("--rtc-delay-history must be positive")
+    if args.rtc_delay_safety_margin < 0:
+        raise ValueError("--rtc-delay-safety-margin must not be negative")
+    if args.rtc_max_guidance_weight <= 0.0:
+        raise ValueError("--rtc-max-guidance-weight must be positive")
     if args.max_actions < 0:
         raise ValueError("--max-actions must not be negative")
     if args.gripper_index < -1:
@@ -539,6 +562,8 @@ def _require_origin_in_workspace(origin_pose: Pose, args: argparse.Namespace) ->
 
 def main() -> None:
     args = parse_args()
+    if not args.async_policy and args.policy_scheduler == "async":
+        args.policy_scheduler = "sync"
     _validate_args(args)
 
     # ── Tool offset configuration ──────────────────────────────────────────
@@ -593,11 +618,19 @@ def main() -> None:
     last_sent_joints: Optional[List[float]] = None
     last_policy_timestamp_s = 0.0
     last_policy_latency_ms = 0.0
-    policy_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1) if args.async_policy else None
+    policy_executor = (
+        concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        if args.policy_scheduler in {"async", "rtc"}
+        else None
+    )
     pending_policy: Optional[concurrent.futures.Future] = None
     sent = 0
 
-    def build_policy_observation() -> Dict[str, Any]:
+    def build_policy_observation(
+        *,
+        rtc_prev_actions: Optional[np.ndarray] = None,
+        rtc_options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         actual_pose = client.get_pose() if args.execute else list(origin_pose)
         actual_joints = client.get_angle() if args.execute else list(origin_joints)
         context = {
@@ -607,6 +640,10 @@ def main() -> None:
             "command_pose_mm_deg": governor.current_target(),
             "instruction": args.instruction,
         }
+        if rtc_prev_actions is not None:
+            context["rtc_prev_actions"] = rtc_prev_actions
+        if rtc_options is not None:
+            context["rtc_options"] = rtc_options
         observation = provider(context) if provider is not None else {}
         if not isinstance(observation, dict):
             raise ValueError("observation provider must return a dictionary")
@@ -619,8 +656,12 @@ def main() -> None:
         raw_actions = extract_action_array(response, args.policy_action_key)
         return raw_actions, request_timestamp_s, policy_latency_ms
 
-    def submit_policy_request() -> concurrent.futures.Future:
-        observation = build_policy_observation()
+    def submit_policy_request(
+        *,
+        rtc_prev_actions: Optional[np.ndarray] = None,
+        rtc_options: Optional[Dict[str, Any]] = None,
+    ) -> concurrent.futures.Future:
+        observation = build_policy_observation(rtc_prev_actions=rtc_prev_actions, rtc_options=rtc_options)
         request_timestamp_s = time.time()
         if policy_executor is None:
             future: concurrent.futures.Future = concurrent.futures.Future()
@@ -629,10 +670,17 @@ def main() -> None:
             except Exception as exc:
                 future.set_exception(exc)
             return future
-        print(f"[PI0-CR5A] async policy request ts={_format_timestamp(request_timestamp_s)}")
+        rtc_text = ""
+        if rtc_options is not None:
+            rtc_text = (
+                " rtc_soft_mask=True"
+                f" d={rtc_options['inference_delay']}"
+                f" end={rtc_options['prefix_attention_horizon']}"
+            )
+        print(f"[PI0-CR5A] async policy request ts={_format_timestamp(request_timestamp_s)}{rtc_text}")
         return policy_executor.submit(run_policy_inference, observation, request_timestamp_s)
 
-    def action_queue_from_policy_result(result: Tuple[np.ndarray, float, float]) -> Tuple[Deque[np.ndarray], float, float]:
+    def action_chunk_from_policy_result(result: Tuple[np.ndarray, float, float]) -> Tuple[np.ndarray, float, float]:
         raw_actions, policy_timestamp_s, policy_latency_ms = result
         print(
             "[PI0-CR5A] "
@@ -645,11 +693,103 @@ def main() -> None:
         )
         if action_kind == "aloha_14d":
             raise RuntimeError("Received ALOHA 14D action; cannot execute on CR5A.")
+        return raw_actions, policy_timestamp_s, policy_latency_ms
+
+    def action_queue_from_policy_result(result: Tuple[np.ndarray, float, float]) -> Tuple[Deque[np.ndarray], float, float]:
+        raw_actions, policy_timestamp_s, policy_latency_ms = action_chunk_from_policy_result(result)
         return (
             deque(np.array(action, dtype=float) for action in raw_actions[: max(args.open_loop_horizon, 1)]),
             policy_timestamp_s,
             policy_latency_ms,
         )
+
+    rtc_s_min = args.rtc_min_execution_horizon or args.open_loop_horizon
+    rtc_delay_steps_history: Deque[int] = deque(maxlen=args.rtc_delay_history)
+    rtc_chunk_horizon = 0
+    rtc_chunk_elapsed = 0
+    rtc_current_chunk_full: Optional[np.ndarray] = None
+    rtc_pending_started_at_sent: Optional[int] = None
+    rtc_inference_started_at_chunk_elapsed: Optional[int] = None
+
+    def rtc_predicted_delay_steps() -> int:
+        if not rtc_delay_steps_history:
+            return max(args.policy_prefetch_remaining, args.rtc_delay_safety_margin, 0)
+        return max(rtc_delay_steps_history) + args.rtc_delay_safety_margin
+
+    def rtc_request_start_step() -> int:
+        horizon = rtc_chunk_horizon if rtc_chunk_horizon > 0 else max(rtc_s_min, args.open_loop_horizon)
+        execution_horizon = min(rtc_s_min, horizon)
+        return max(execution_horizon - rtc_predicted_delay_steps(), 0)
+
+    def rtc_previous_condition_chunk() -> Optional[np.ndarray]:
+        if not args.rtc_soft_mask or rtc_current_chunk_full is None:
+            return None
+        start = min(max(rtc_chunk_elapsed, 0), int(rtc_current_chunk_full.shape[0]))
+        condition = np.zeros_like(rtc_current_chunk_full)
+        remaining = rtc_current_chunk_full[start:]
+        if len(remaining) > 0:
+            condition[: len(remaining)] = remaining
+        return condition
+
+    def rtc_submit_policy_request() -> concurrent.futures.Future:
+        nonlocal rtc_pending_started_at_sent, rtc_inference_started_at_chunk_elapsed
+        rtc_pending_started_at_sent = sent
+        rtc_inference_started_at_chunk_elapsed = rtc_chunk_elapsed
+        d_pred = rtc_predicted_delay_steps()
+        rtc_prev_actions = rtc_previous_condition_chunk()
+        rtc_options = None
+        if rtc_prev_actions is not None:
+            horizon = int(rtc_prev_actions.shape[0])
+            execution_horizon = min(rtc_s_min, horizon)
+            rtc_options = {
+                "inference_delay": d_pred,
+                "prefix_attention_horizon": max(horizon - execution_horizon, 0),
+                "max_guidance_weight": args.rtc_max_guidance_weight,
+            }
+        print(
+            "[RTC] submit "
+            f"sent={sent} chunk_elapsed={rtc_chunk_elapsed} "
+            f"d_pred={d_pred} start={rtc_request_start_step()} "
+            f"soft_mask={rtc_options is not None}"
+        )
+        return submit_policy_request(rtc_prev_actions=rtc_prev_actions, rtc_options=rtc_options)
+
+    def rtc_install_policy_result(result: Tuple[np.ndarray, float, float]) -> Tuple[float, float]:
+        nonlocal action_queue, rtc_chunk_horizon, rtc_chunk_elapsed, rtc_current_chunk_full
+        nonlocal rtc_pending_started_at_sent, rtc_inference_started_at_chunk_elapsed
+        raw_actions, policy_timestamp_s, policy_latency_ms = action_chunk_from_policy_result(result)
+        horizon = int(raw_actions.shape[0])
+        if horizon <= 0:
+            raise RuntimeError("RTC received an empty policy chunk")
+        if rtc_s_min > horizon:
+            print(
+                "[RTC] WARNING: rtc_min_execution_horizon exceeds policy horizon; "
+                f"s_min={rtc_s_min}, horizon={horizon}. Clamping scheduling horizon to {horizon}."
+            )
+        request_sent = sent if rtc_pending_started_at_sent is None else rtc_pending_started_at_sent
+        elapsed_steps = max(sent - request_sent, 0)
+        latency_steps = max(int(math.ceil((policy_latency_ms / 1000.0) / period)), elapsed_steps)
+        rtc_delay_steps_history.append(latency_steps)
+        skip = min(elapsed_steps, horizon)
+        if skip >= horizon:
+            raise RuntimeError(
+                "RTC policy result is stale: "
+                f"elapsed_steps={elapsed_steps} >= horizon={horizon}. "
+                "Reduce policy latency, lower command rate, or increase action horizon."
+            )
+        rtc_current_chunk_full = raw_actions
+        action_queue = deque(np.array(action, dtype=float) for action in raw_actions[skip:])
+        rtc_chunk_horizon = horizon
+        rtc_chunk_elapsed = skip
+        print(
+            "[RTC] install "
+            f"horizon={horizon} elapsed={elapsed_steps} skip={skip} "
+            f"latency_ms={policy_latency_ms:.1f} latency_steps={latency_steps} "
+            f"queue={len(action_queue)} next_start={rtc_request_start_step()}"
+        )
+        rtc_pending_started_at_sent = None
+        rtc_inference_started_at_chunk_elapsed = None
+        return policy_timestamp_s, policy_latency_ms
 
     print("PI0/OpenPI -> CR5A bridge")
     print(
@@ -663,8 +803,10 @@ def main() -> None:
         )
     print(
         "Policy scheduling: "
-        f"async={args.async_policy}, open_loop_horizon={args.open_loop_horizon}, "
-        f"prefetch_remaining={args.policy_prefetch_remaining}"
+        f"scheduler={args.policy_scheduler}, async={args.async_policy}, "
+        f"open_loop_horizon={args.open_loop_horizon}, prefetch_remaining={args.policy_prefetch_remaining}, "
+        f"rtc_s_min={rtc_s_min}, rtc_delay_history={args.rtc_delay_history}, "
+        f"rtc_delay_margin={args.rtc_delay_safety_margin}"
     )
     print(
         "Safety: "
@@ -726,30 +868,56 @@ def main() -> None:
             dt = min(max(now - last_tick, 0.0), args.max_control_dt)
             last_tick = now
 
-            if pending_policy is not None and pending_policy.done():
-                try:
+            if args.policy_scheduler == "rtc":
+                if pending_policy is not None and pending_policy.done():
+                    try:
+                        last_policy_timestamp_s, last_policy_latency_ms = rtc_install_policy_result(
+                            pending_policy.result()
+                        )
+                    finally:
+                        pending_policy = None
+
+                if not action_queue:
+                    if pending_policy is None:
+                        pending_policy = rtc_submit_policy_request()
+                    last_policy_timestamp_s, last_policy_latency_ms = rtc_install_policy_result(
+                        pending_policy.result()
+                    )
+                    pending_policy = None
+
+                if (
+                    pending_policy is None
+                    and rtc_chunk_horizon > 0
+                    and rtc_chunk_elapsed >= rtc_request_start_step()
+                ):
+                    pending_policy = rtc_submit_policy_request()
+            else:
+                if pending_policy is not None and pending_policy.done():
+                    try:
+                        action_queue, last_policy_timestamp_s, last_policy_latency_ms = action_queue_from_policy_result(
+                            pending_policy.result()
+                        )
+                    finally:
+                        pending_policy = None
+
+                if not action_queue:
+                    if pending_policy is None:
+                        pending_policy = submit_policy_request()
                     action_queue, last_policy_timestamp_s, last_policy_latency_ms = action_queue_from_policy_result(
                         pending_policy.result()
                     )
-                finally:
                     pending_policy = None
 
-            if not action_queue:
-                if pending_policy is None:
+                if (
+                    args.policy_scheduler == "async"
+                    and pending_policy is None
+                    and len(action_queue) <= args.policy_prefetch_remaining
+                ):
                     pending_policy = submit_policy_request()
-                action_queue, last_policy_timestamp_s, last_policy_latency_ms = action_queue_from_policy_result(
-                    pending_policy.result()
-                )
-                pending_policy = None
-
-            if (
-                args.async_policy
-                and pending_policy is None
-                and len(action_queue) <= args.policy_prefetch_remaining
-            ):
-                pending_policy = submit_policy_request()
 
             action = action_queue.popleft()
+            if args.policy_scheduler == "rtc":
+                rtc_chunk_elapsed += 1
             model_target, gripper_trigger = adapter.adapt(action, governor.current_target())
 
             # ── Convert gripper_center → TCP for robot command ───────────

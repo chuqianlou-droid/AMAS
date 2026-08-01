@@ -67,7 +67,9 @@ class Policy(BasePolicy):
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
-        inputs = jax.tree.map(lambda x: x, obs)
+        raw_inputs = dict(obs)
+        rtc_options = raw_inputs.pop("__rtc", None)
+        inputs = jax.tree.map(lambda x: x, raw_inputs)
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -86,6 +88,17 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+        if rtc_options is not None:
+            if self._is_pytorch_model:
+                raise NotImplementedError("RTC soft-mask sampling is only implemented for the JAX PI0 policy.")
+            if "actions" not in inputs:
+                raise ValueError("RTC soft-mask sampling requires an 'action' chunk in the observation.")
+            sample_kwargs["rtc_prev_actions"] = inputs["actions"]
+            sample_kwargs["rtc_inference_delay"] = int(rtc_options.get("inference_delay", 0))
+            sample_kwargs["rtc_prefix_attention_horizon"] = int(
+                rtc_options.get("prefix_attention_horizon", inputs["actions"].shape[-2])
+            )
+            sample_kwargs["rtc_max_guidance_weight"] = float(rtc_options.get("max_guidance_weight", 5.0))
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
@@ -103,6 +116,8 @@ class Policy(BasePolicy):
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        if rtc_options is not None:
+            outputs["policy_timing"]["rtc"] = dict(rtc_options)
         return outputs
 
     @property

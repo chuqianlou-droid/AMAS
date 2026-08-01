@@ -11,6 +11,261 @@
 
 ---
 
+## BUG-008: LeRobot gripper 标签仍使用 Quest trigger 而不是真实夹爪状态
+
+**日期**：2026-07-05
+
+### 现象
+
+- BUG-007 已经把 action 前 6 维改成真实机械臂轨迹差分，但第 7 维 gripper 仍可能来自 Quest 右扳机。
+- Quest/teleop 有 300-400ms 延迟时，画面里的夹爪实际还没闭合，训练标签却可能已经是“闭合”。
+- policy 上机后容易表现为提前夹取、空夹，尤其在接近物体阶段更明显。
+
+### 触发条件
+
+1. 遥操作端通过 Quest trigger 控制 PGE 夹爪。
+2. 录制端使用旧逻辑：
+
+```python
+grippers.append(0.0)
+gripper_actions.append(sample.gripper_command)
+actions[:, 6] = gripper_commands
+```
+
+其中 `sample.gripper_command` 是遥操作命令，不是 PGE 夹爪当前位置。
+
+### 根因
+
+CR5A feedback 端口 `30004` 能实时读取 `ToolVectorActual/QActual`，但不包含 PGE 夹爪位置。录制端不能再单独占用 Dashboard `29999` 去开第二个 Modbus 连接，因为遥操作端已经用它控制机械臂和夹爪。
+
+因此真实夹爪状态必须从已经持有 Modbus 连接的遥操作端读取，然后随 UDP action stream 一起发给录制端。
+
+### 修复方案
+
+在 `toolframe_governor_teleop.py` 的 `PgeModbusGripper` 中增加 PGE 反馈寄存器：
+
+```python
+REG_GRIP_STATUS = 0x0201
+REG_CURRENT_POSITION = 0x0202
+```
+
+遥操作端每隔 `--gripper-state-read-interval-s` 从 `0x0202` 读取当前位置，并换算为：
+
+```text
+0.0 = 张开
+1.0 = 闭合
+```
+
+然后通过 `TeleopAction.gripper_state` 发布到 UDP。
+
+录制端改为：
+
+```python
+observation.state[6] = sample.gripper_state
+action[i, 6] = gripper_state[i + 1]
+```
+
+也就是说：
+
+- 当前观测里的 gripper 是当前真实夹爪状态。
+- 训练 action 的 gripper 是下一帧真实夹爪状态，和前 6 维“当前帧到下一帧”的真实运动标签保持一致。
+- 如果旧遥操作端没有发布 `gripper_state`，录制端会兼容性退回 `gripper_command`，但新采集必须使用更新后的遥操作端。
+
+### 验证方法
+
+- 启动遥操作端后日志应出现 `gripper_state=...`。
+- 张开时 `gripper_state` 应接近 0，闭合时应接近 1。
+- 录制端日志每 30 帧会打印 `gripper_state=...`。
+- 新保存的数据中 `observation.state[:, 6]` 和 `action[:, 6]` 应随真实夹爪运动变化，不应再固定为 0 或直接等于 Quest trigger 时间线。
+
+### 回退方法
+
+如需严格回退到旧 trigger 行为：
+
+1. 删除 `TeleopAction.gripper_state` 字段及发布逻辑。
+2. 将 `record_cr5a_pi0_dataset.py` 中的：
+
+```python
+grippers.append(sample.gripper_state)
+gripper_states.append(sample.gripper_state)
+actions_arr = _feedback_delta_actions(gripper_center_poses, gripper_states)
+```
+
+改回：
+
+```python
+grippers.append(0.0)
+gripper_actions.append(sample.gripper_command)
+actions_arr = _feedback_delta_actions(gripper_center_poses, gripper_actions)
+```
+
+3. 将 `_feedback_delta_actions()` 的第 7 维改回 `actions[:, 6] = gripper_commands`。
+
+---
+
+## BUG-007: LeRobot action 标签仍可能使用遥操作命令增量导致时间错位
+
+**日期**：2026-07-05
+
+### 现象
+
+- BUG-006 修复后，图像和 `observation.state` 已经改为真实反馈对齐。
+- 但如果 `action` 仍直接保存遥操作 UDP 中的命令 delta，Quest/teleop 300-400ms 延迟仍可能污染训练标签。
+- 结果可能仍表现为 policy 提前停止、提前夹取或对真实画面反应不稳定。
+
+### 触发条件
+
+1. 录制端使用 `--action-source teleop`。
+2. 旧逻辑中直接执行：
+
+```python
+actions.append(validate_cr5a_action(sample.action))
+```
+
+这里的 `sample.action` 来自遥操作端：
+
+```python
+action = pose_action_delta_mm_deg(prev_cmd_target, cmd_target) + [gripper_cmd]
+```
+
+### 根因
+
+遥操作命令 delta 属于控制端时间线，不一定与录制端当前相机帧和当前真实机器人反馈严格同步。
+
+BUG-006 已经把状态改为：
+
+```text
+image_t -> ToolVectorActual_t / QActual_t
+```
+
+但旧 action 仍可能是：
+
+```text
+teleop_command_t
+```
+
+如果 Quest/teleop 链路延迟明显，训练样本仍可能变成：
+
+```text
+真实 image/state_t -> 时间错位的 command action
+```
+
+### 修复方案
+
+保存 episode 时不再使用 `sample.action` 作为训练 action。改为根据录制到的真实 gripper_center 位姿序列生成 action：
+
+```python
+action[i, :6] = pose_delta(gripper_center_pose[i], gripper_center_pose[i + 1])
+action[i, 6] = gripper_state[i + 1]
+```
+
+其中：
+
+- 前 6 维：真实机械臂反馈轨迹的相对位姿差分。
+- 第 7 维：BUG-008 修复后使用 PGE 实际夹爪状态，不再使用 Quest trigger 命令。
+- 最后一帧没有下一帧，位姿 delta 记为 0。
+
+### 验证方法
+
+- 录制时日志仍会打印 `teleop_action=...`，但这只是调试参考，不再是保存到 LeRobot 的训练 action。
+- 保存后检查 `Nonzero action ratio` 应来自真实运动轨迹差分。
+- 新数据集中的 `action` 前 6 维应对应相邻两帧 `gripper_center` 真实位姿变化。
+
+### 回退方法
+
+如需回到旧行为，将 `record_cr5a_pi0_dataset.py` 保存前的：
+
+```python
+actions_arr = _feedback_delta_actions(gripper_center_poses, gripper_actions)
+```
+
+改回实时循环中保存：
+
+```python
+actions.append(validate_cr5a_action(sample.action))
+```
+
+## BUG-006: 采集数据的图像与机械臂状态可能不同步（Quest 控制参考污染）
+
+**日期**：2026-07-05
+
+### 现象
+
+- 使用 Quest3 遥操作采集 LeRobot 数据后，pi0/LoRA 推理时容易出现提前停止、提前夹取。
+- 两个相机画面和训练视频本身看起来正常，但模型在真实机械臂上接近物体时会空夹。
+- Quest3 遥操作链路估计有 300-400ms 延迟，约等于 15Hz 采集下的 4.5-6 帧。
+- 初版改为 Dashboard `GetPose/GetAngle` 后，录制端报错：`Connection refused, IP:Port has been occupied`，因为遥操作端已经占用 29999。
+
+### 触发条件
+
+1. 遥操作端发布 `--publish-action-stream`。
+2. 录制端使用 `record_cr5a_pi0_dataset.py --action-source teleop`。
+3. 旧默认 `--teleop-state-source stream` 时，录制端使用遥操作 UDP 包里的 `current_pose/current_joints` 作为训练状态。
+
+### 根因
+
+`stream` 模式下，数据集中的状态不是录制时刻机械臂的物理反馈，而是遥操作进程里的控制参考：
+
+```python
+# toolframe_governor_teleop.py
+current_pose=tuple(prev_cmd_target)
+target_pose=tuple(cmd_target)
+current_joints=tuple(last_sent_joints)
+```
+
+录制脚本随后把这些 stream state 与相机帧配对：
+
+```python
+# record_cr5a_pi0_dataset.py 旧逻辑
+raw_tcp = sample.controller_pose
+joints = sample.controller_joints
+```
+
+当 Quest/teleop 链路有 300-400ms 延迟时，图像可能是真实夹爪还没到物体的画面，但 state/action/gripper label 已经来自更靠前的控制参考。模仿学习会把这种错误配对学成“看到还没到位就停止或闭合夹爪”。
+
+### 修复方案
+
+保留原有采集操作逻辑：action/deadman/drop/camera 采集流程不变。
+
+只修改训练状态来源：
+
+- `--teleop-state-source` 默认从 `stream` 改为 `feedback`。
+- 每帧成功取到 RealSense 图像后，立即通过 Dobot feedback 端口 30004 读取真实机械臂反馈：
+
+```python
+d435, d415 = camera.get_rgb_images()
+image_timestamp_s = time.time()
+raw_tcp = np.asarray(feedback["ToolVectorActual"], dtype=np.float32)
+joints = np.asarray(feedback["QActual"], dtype=np.float32)
+```
+
+- 保存的 `timestamps` 使用相机帧取到后的时间 `image_timestamp_s`，而不是完成状态读取后的更晚时间。
+- `stream` 模式保留为 legacy fallback，但不再作为默认训练采集方式。
+- `dashboard` 模式保留为显式调试选项，但真实遥操作采集不要使用它，因为 29999 通常已经被控制端占用。
+
+### 验证方法
+
+- 启动录制时确认终端打印：
+
+```text
+Teleop state source: feedback
+State/image alignment: camera frame -> immediate live ToolVectorActual/QActual sample
+```
+
+- 录制时不再显式传入 `--teleop-state-source stream`。
+- 录制时也不要显式传入 `--teleop-state-source dashboard`，除非终端 1 没有占用 29999。
+- 重新采集少量 episode 后，重点检查夹爪闭合帧：画面中夹爪应已经接近/接触物体，而不是明显提前闭合。
+
+### 回退方法
+
+如需回到旧行为，在录制命令中显式加入：
+
+```bash
+--teleop-state-source stream
+```
+
+或将 `record_cr5a_pi0_dataset.py` 中 `--teleop-state-source` 默认值改回 `stream`。
+
 ## BUG-001: 首次 RG 按下时机械臂剧烈抖动（Euler 角表示不唯一）
 
 **日期**：2026-06-27

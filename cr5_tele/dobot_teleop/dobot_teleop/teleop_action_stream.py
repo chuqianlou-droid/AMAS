@@ -35,6 +35,10 @@ class TeleopAction:
     target (TCP frame).  It intentionally avoids an extra synchronous
     ``GetPose`` call in the teleop loop.
 
+    ``gripper_state`` is the measured PGE gripper closedness when available:
+    0.0=open, 1.0=closed.  Older publishers may omit it, so subscribers fall
+    back to ``gripper_command``.
+
     ``gripper_center_pose`` and ``gripper_center_target`` (optional) are the
     same poses transformed to the gripper-center frame via the tool offset.
     When tool offset is active, the recorder uses these for training labels.
@@ -50,6 +54,7 @@ class TeleopAction:
     deadman: bool
     servo_sent: bool
     gripper_command: float
+    gripper_state: float | None = None
     gripper_center_pose: tuple[float, ...] | None = None
     gripper_center_target: tuple[float, ...] | None = None
 
@@ -71,6 +76,8 @@ class TeleopAction:
             _finite_vector(self.gripper_center_target, POSE_DIM, "gripper_center_target")
         if not math.isfinite(float(self.gripper_command)):
             raise ValueError("gripper_command must be finite")
+        if self.gripper_state is not None and not math.isfinite(float(self.gripper_state)):
+            raise ValueError("gripper_state must be finite")
 
     def to_dict(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -85,6 +92,8 @@ class TeleopAction:
             "servo_sent": bool(self.servo_sent),
             "gripper_command": float(self.gripper_command),
         }
+        if self.gripper_state is not None:
+            result["gripper_state"] = float(self.gripper_state)
         if self.gripper_center_pose is not None:
             result["gripper_center_pose"] = list(self.gripper_center_pose)
         if self.gripper_center_target is not None:
@@ -107,6 +116,7 @@ class TeleopAction:
             deadman=bool(data["deadman"]),
             servo_sent=bool(data["servo_sent"]),
             gripper_command=float(data.get("gripper_command", 0.0)),
+            gripper_state=float(data["gripper_state"]) if "gripper_state" in data else None,
             gripper_center_pose=(
                 None if gc_pose is None else _finite_vector(gc_pose, POSE_DIM, "gripper_center_pose")
             ),

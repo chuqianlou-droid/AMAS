@@ -1,0 +1,46 @@
+
+# Python cache
+**/__pycache__/
+*.py[cod]
+
+# Local settings
+**/.claude/settings.local.json
+
+# Compressed packages
+*.zip
+*.tar.gz
+*.tgz
+*.7z
+
+# Robot recordings and datasets
+data/
+datasets/
+recordings/
+trajectories/
+rosbags/
+outputs/
+runs/
+
+# Video and ROS bags
+*.mp4
+*.avi
+*.mov
+*.bag
+*.db3
+*.mcap
+
+# Models and checkpoints
+checkpoints/
+weights/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Development environments
+.venv/
+venv/
+node_modules/
+build/
+install/
+log/
