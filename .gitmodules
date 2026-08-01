@@ -1,0 +1,6 @@
+[submodule "Unitree_develop/unitree_ros"]
+	path = Unitree_develop/unitree_ros
+	url = https://github.com/unitreerobotics/unitree_ros.git
+[submodule "cr5_tele/real-time-chunking-kinetix"]
+	path = cr5_tele/real-time-chunking-kinetix
+	url = https://github.com/Physical-Intelligence/real-time-chunking-kinetix.git
