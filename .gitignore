@@ -44,3 +44,30 @@ node_modules/
 build/
 install/
 log/
+
+# Local Claude configuration
+cr5_tele/.claude/settings.local.json
+
+# Python environments and cache
+**/.venv/
+**/venv/
+**/__pycache__/
+*.py[cod]
+
+# Training outputs and model checkpoints
+**/outputs/
+**/checkpoints/
+**/wandb/
+**/runs/
+
+# Dataset and recordings
+**/datasets/
+**/recordings/
+**/rosbags/
+
+# Large robot data
+*.bag
+*.db3
+*.mcap
+*.mp4
+*.avi
